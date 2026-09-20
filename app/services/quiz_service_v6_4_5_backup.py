@@ -88,7 +88,7 @@ SEMANTIC_BATCH_MAX_TOKENS = 3200
 SEMANTIC_FAST_GATE_VERSION = "FG-V1.2"
 FAST_EVIDENCE_MAX_CHARS = 500
 
-PERFORMANCE_VERSION = "PERF-V6.4.9"
+PERFORMANCE_VERSION = "PERF-V6.4.5"
 
 # Deterministic micro-context selector.
 MICRO_CONTEXT_VERSION = "MC-V1"
@@ -115,10 +115,6 @@ OPTION_OVERLAP_VERSION = "OO-V1"
 FORMULA_AMBIGUITY_VERSION = "FA-V1"
 OPTION_SHAPE_VERSION = "OS-V1.1"
 LABEL_SHAPE_VERSION = "LS-V1"
-DISTRACTOR_POOL_VERSION = "DP-V1"
-HIGH_RISK_REPAIR_VERSION = "HRR-V1"
-CLOZE_RELATION_PRECEDENCE_VERSION = "CRP-V1"
-FINAL_FORMULA_NORMALIZATION_VERSION = "FFN-V1"
 ANSWER_INTRINSIC_QUALITY_VERSION = "AIQ-V1.1"
 LANGUAGE_FIT_VERSION = "LF-V1"
 SEMANTIC_FIT_VERSION = "SF-V1"
@@ -1729,42 +1725,6 @@ def _detect_question_relation(
     """
 
     text = str(question_text or "").strip().lower()
-
-    # =====================================================
-    # CRP-V1: deterministic cloze relation precedence
-    #
-    # A backend-generated cloze may quote source wording
-    # containing terms such as "tác động", "mục đích",
-    # "nguyên nhân", etc. Those words describe the SOURCE
-    # content, not the semantic relation being asked.
-    #
-    # Therefore a recognized deterministic cloze prefix +
-    # blank is classified first as FACT/FORMULA.
-    # =====================================================
-
-    if "_____" in text:
-        formula_cloze_prefixes = (
-            "điền công thức thích hợp vào chỗ trống:",
-            "fill in the appropriate formula:",
-        )
-
-        fact_cloze_prefixes = (
-            "điền cụm từ thích hợp vào chỗ trống:",
-            "điền từ thích hợp vào chỗ trống:",
-            "fill in the blank with the appropriate term:",
-        )
-
-        if any(
-            text.startswith(prefix)
-            for prefix in formula_cloze_prefixes
-        ):
-            return QUESTION_RELATION_FORMULA
-
-        if any(
-            text.startswith(prefix)
-            for prefix in fact_cloze_prefixes
-        ):
-            return QUESTION_RELATION_FACT
 
     # =====================================================
     # PURPOSE
@@ -6092,111 +6052,6 @@ def _looks_like_concept_label(
     return True
 
 
-
-def _build_section_distractor_pool(
-    chunks: list[DocumentChunk],
-) -> dict[int, list[str]]:
-    """
-    DP-V1: deterministic section-aware distractor pool.
-
-    Build backend-owned candidate terms from ALL already-loaded
-    active chunks in the same semantic section. No extra AI call.
-    """
-
-    pools: dict[int, list[str]] = {}
-    seen_by_section: dict[int, set[str]] = {}
-
-    for chunk in chunks:
-        section_id = getattr(
-            chunk,
-            "section_id",
-            None,
-        )
-
-        if section_id is None:
-            continue
-
-        section_id = int(
-            section_id
-        )
-
-        content = str(
-            getattr(
-                chunk,
-                "content",
-                "",
-            )
-            or ""
-        ).strip()
-
-        if not content:
-            continue
-
-        evidence_units = _evidence_units_for_context(
-            content[:6000]
-        )
-
-        if not evidence_units:
-            evidence_units = [
-                content[:6000]
-            ]
-
-        evidence_map = {
-            f"E{index}": unit
-            for index, unit
-            in enumerate(
-                evidence_units
-            )
-        }
-
-        answer_catalog = _build_answer_catalog(
-            evidence_map
-        )
-
-        pool = pools.setdefault(
-            section_id,
-            [],
-        )
-
-        seen = seen_by_section.setdefault(
-            section_id,
-            set(),
-        )
-
-        for answer_spec in answer_catalog.values():
-            candidate = str(
-                answer_spec.get(
-                    "text",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            norm = _normalize_compare_text(
-                candidate
-            )
-
-            if (
-                not candidate
-                or not norm
-                or norm in seen
-            ):
-                continue
-
-            seen.add(
-                norm
-            )
-
-            pool.append(
-                candidate
-            )
-
-            if len(pool) >= 80:
-                break
-
-    return pools
-
-
 def _sanitize_v6_distractors(
     *,
     model_distractors: list,
@@ -6206,7 +6061,6 @@ def _sanitize_v6_distractors(
         str,
         dict,
     ],
-    extra_candidates: list[str] | None = None,
 ) -> tuple[
     list[str],
     int,
@@ -6379,20 +6233,6 @@ def _sanitize_v6_distractors(
                 candidate_text
             )
 
-    for candidate_text in (
-        extra_candidates
-        or []
-    ):
-        candidate_text = str(
-            candidate_text
-            or ""
-        ).strip()
-
-        if candidate_text:
-            backend_pool.append(
-                candidate_text
-            )
-
     # Prefer concept-label alternatives first for
     # dictionary/label-style questions, then concise text.
     label_style = (
@@ -6488,505 +6328,6 @@ def _sanitize_v6_distractors(
     )
 
 
-
-def _deterministic_high_risk_relation_repair(
-    *,
-    question_text: str,
-    answer_text: str,
-    evidence_quote: str,
-) -> str | None:
-    """
-    HRR-V1
-
-    Convert a high-risk semantic-relation stem
-    (PURPOSE / REQUIREMENT / CAUSE / EFFECT)
-    into a direct source-grounded cloze question.
-
-    The backend-owned correct answer is masked inside its
-    exact evidence. No AI call is used.
-    """
-
-    relation = _detect_question_relation(
-        question_text
-    )
-
-    if relation not in {
-        QUESTION_RELATION_PURPOSE,
-        QUESTION_RELATION_REQUIREMENT,
-        QUESTION_RELATION_CAUSE,
-        QUESTION_RELATION_EFFECT,
-    }:
-        return None
-
-    intrinsic_issue = (
-        _answer_candidate_intrinsic_issue(
-            answer_text
-        )
-    )
-
-    if intrinsic_issue:
-        return None
-
-    masked = _mask_answer_in_evidence(
-        evidence_text=evidence_quote,
-        answer_text=answer_text,
-    )
-
-    if not masked:
-        return None
-
-    context = _compact_cloze_context(
-        masked
-    )
-
-    if not context:
-        return None
-
-    # Remove bullets/list decoration around the masked term.
-    context = re.sub(
-        r"^(\s*…\s*)"
-        r"(?:[•●▪◦]+|[-*]+)\s*",
-        r"\1",
-        context,
-    )
-
-    context = re.sub(
-        r"^\s*(?:[•●▪◦]+|[-*]+)\s*",
-        "",
-        context,
-    ).strip()
-
-    if not context:
-        return None
-
-    language = _text_language_hint(
-        evidence_quote
-    )
-
-    if "=" in str(
-        answer_text
-        or ""
-    ):
-        if language == "EN":
-            prefix = (
-                "Fill in the appropriate formula: "
-            )
-        else:
-            prefix = (
-                "Điền công thức thích hợp vào chỗ trống: "
-            )
-    else:
-        if language == "EN":
-            prefix = (
-                "Fill in the blank with the appropriate term: "
-            )
-        else:
-            prefix = (
-                "Điền cụm từ thích hợp vào chỗ trống: "
-            )
-
-    repaired = (
-        prefix
-        + context
-    ).strip()
-
-    # A successful repair must itself no longer be high-risk.
-    repaired_relation = _detect_question_relation(
-        repaired
-    )
-
-    if repaired_relation in {
-        QUESTION_RELATION_PURPOSE,
-        QUESTION_RELATION_REQUIREMENT,
-        QUESTION_RELATION_CAUSE,
-        QUESTION_RELATION_EFFECT,
-    }:
-        return None
-
-    return repaired
-
-
-
-def _normalize_single_formula_expression(
-    value: str,
-) -> str:
-    """
-    FFN-V1
-
-    Normalize one formula option to a standalone expression.
-
-    Examples:
-      "trong đó T' = T + ΔT" -> "T' = T + ΔT"
-      "khi đó W = k + m"     -> "W = k + m"
-
-    Important:
-    Do NOT rebuild the formula with the older ASCII-oriented
-    equation extractor because valid source formulas may
-    contain Unicode symbols such as Δ.
-    """
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        str(
-            value
-            or ""
-        ),
-    ).strip()
-
-    if "=" not in text:
-        return text
-
-    # Strip only harmless discourse/formula-introduction
-    # prefixes. Everything after the prefix is preserved
-    # verbatim apart from outer punctuation/whitespace.
-    prefix_pattern = re.compile(
-        r"^(?:"
-        r"trong\s+đó"
-        r"|khi\s+đó"
-        r"|do\s+đó"
-        r"|từ\s+đó"
-        r"|suy\s+ra"
-        r"|ta\s+có"
-        r"|công\s+thức(?:\s+là)?"
-        r"|biểu\s+thức(?:\s+là)?"
-        r"|where"
-        r"|therefore"
-        r"|thus"
-        r")\s*[:,\-]?\s*",
-        flags=re.IGNORECASE,
-    )
-
-    stripped = prefix_pattern.sub(
-        "",
-        text,
-        count=1,
-    ).strip()
-
-    if (
-        stripped
-        and "=" in stripped
-        and stripped != text
-    ):
-        return stripped.strip(
-            " \t\r\n,;:.!?"
-        )
-
-    # Standard ASCII-style formulas can still be reduced
-    # safely when exactly one equation is present.
-    equations = _extract_equations(
-        text
-    )
-
-    if len(
-        equations
-    ) == 1:
-        equation = equations[
-            0
-        ]
-
-        # Only use extractor fallback when it consumed the
-        # formula tail fully enough. This avoids truncating
-        # values that contain Unicode symbols such as Δ.
-        tail_after_equal = (
-            text.split(
-                "=",
-                1,
-            )[1]
-            .strip()
-            .strip(
-                " \t\r\n,;:.!?"
-            )
-        )
-
-        extracted_tail = (
-            equation.split(
-                "=",
-                1,
-            )[1]
-            .strip()
-            .strip(
-                " \t\r\n,;:.!?"
-            )
-        )
-
-        if (
-            tail_after_equal
-            == extracted_tail
-        ):
-            return equation
-
-    return text.strip(
-        " \t\r\n"
-    )
-
-
-def _formula_rewrite_stem_needs_context(
-    *,
-    question_text: str,
-    correct_formula: str,
-    evidence_quote: str,
-) -> bool:
-    """
-    Detect context-poor transformation questions such as:
-
-        "Công thức W được viết lại thành gì?"
-
-    when evidence contains more than one W-formula.
-    """
-
-    question = str(
-        question_text
-        or ""
-    ).strip()
-
-    if not question:
-        return False
-
-    # Existing deterministic cloze is already contextual.
-    if "_____" in question:
-        return False
-
-    q_norm = _normalize_compare_text(
-        question
-    )
-
-    rewrite_markers = (
-        "viết lại thành gì",
-        "được viết lại thành gì",
-        "chuyển thành gì",
-        "được chuyển thành gì",
-        "biến thành gì",
-        "được biến thành gì",
-        "rewrite",
-        "rewritten as",
-        "converted to",
-    )
-
-    if not any(
-        marker in q_norm
-        for marker in rewrite_markers
-    ):
-        return False
-
-    correct_lhs = _equation_lhs(
-        correct_formula
-    )
-
-    if not correct_lhs:
-        return False
-
-    same_lhs_evidence = [
-        equation
-        for equation
-        in _extract_equations(
-            evidence_quote
-        )
-        if _equation_lhs(
-            equation
-        )
-        == correct_lhs
-    ]
-
-    if len(
-        same_lhs_evidence
-    ) < 2:
-        return False
-
-    # If an explicit equation is already present in the
-    # stem, the learner has concrete transformation context.
-    if _extract_equations(
-        question
-    ):
-        return False
-
-    return True
-
-
-def _final_formula_normalization(
-    question: QuestionCreate,
-    *,
-    evidence_quote: str,
-) -> tuple[
-    QuestionCreate,
-    int,
-    bool,
-]:
-    """
-    FFN-V1 final deterministic cleanup.
-
-    1) Convert formula options such as
-         "trong đó T' = T + ΔT"
-       into
-         "T' = T + ΔT"
-
-    2) Convert context-poor rewrite stems such as
-         "Công thức W được viết lại thành gì?"
-       into a source-grounded formula cloze using the
-       existing deterministic cloze repair.
-
-    No AI call is used.
-    """
-
-    correct_options = [
-        option
-        for option in question.options
-        if option.is_correct
-    ]
-
-    if len(
-        correct_options
-    ) != 1:
-        return (
-            question,
-            0,
-            False,
-        )
-
-    correct_before = str(
-        correct_options[
-            0
-        ].option_text
-        or ""
-    ).strip()
-
-    relation = _detect_question_relation(
-        question.question_text
-    )
-
-    formula_mode = (
-        relation
-        == QUESTION_RELATION_FORMULA
-        or "=" in correct_before
-    )
-
-    if not formula_mode:
-        return (
-            question,
-            0,
-            False,
-        )
-
-    normalized_options = []
-    normalized_count = 0
-
-    for option in question.options:
-        original_text = str(
-            option.option_text
-            or ""
-        ).strip()
-
-        normalized_text = (
-            _normalize_single_formula_expression(
-                original_text
-            )
-        )
-
-        if (
-            normalized_text
-            and normalized_text
-            != original_text
-        ):
-            normalized_count += 1
-
-        if hasattr(
-            option,
-            "model_copy",
-        ):
-            normalized_option = (
-                option.model_copy(
-                    update={
-                        "option_text": (
-                            normalized_text
-                        )
-                    }
-                )
-            )
-        else:
-            option.option_text = (
-                normalized_text
-            )
-            normalized_option = option
-
-        normalized_options.append(
-            normalized_option
-        )
-
-    if hasattr(
-        question,
-        "model_copy",
-    ):
-        normalized_question = (
-            question.model_copy(
-                update={
-                    "options": (
-                        normalized_options
-                    )
-                }
-            )
-        )
-    else:
-        question.options = (
-            normalized_options
-        )
-        normalized_question = question
-
-    normalized_correct_options = [
-        option
-        for option
-        in normalized_question.options
-        if option.is_correct
-    ]
-
-    if len(
-        normalized_correct_options
-    ) != 1:
-        return (
-            normalized_question,
-            normalized_count,
-            False,
-        )
-
-    correct_formula = str(
-        normalized_correct_options[
-            0
-        ].option_text
-        or ""
-    ).strip()
-
-    contextualized = False
-
-    if _formula_rewrite_stem_needs_context(
-        question_text=(
-            normalized_question.question_text
-        ),
-        correct_formula=(
-            correct_formula
-        ),
-        evidence_quote=(
-            evidence_quote
-        ),
-    ):
-        repaired = (
-            _deterministic_cloze_repair(
-                normalized_question,
-                evidence_quote=(
-                    evidence_quote
-                ),
-            )
-        )
-
-        if repaired is not None:
-            normalized_question = repaired
-            contextualized = True
-
-    return (
-        normalized_question,
-        normalized_count,
-        contextualized,
-    )
-
-
 def _compact_item_to_raw_question(
     item: dict,
     *,
@@ -7000,11 +6341,6 @@ def _compact_item_to_raw_question(
     answer_by_slot: dict[
         str,
         dict[str, dict],
-    ]
-    | None = None,
-    distractor_candidates_by_slot: dict[
-        str,
-        list[str],
     ]
     | None = None,
 ) -> dict:
@@ -7207,17 +6543,6 @@ def _compact_item_to_raw_question(
             slot_answers=(
                 slot_answers
             ),
-            extra_candidates=(
-                (
-                    distractor_candidates_by_slot
-                    or {}
-                ).get(
-                    str(
-                        slot_id
-                    ),
-                    [],
-                )
-            ),
         )
 
         if distractor_replacements_used:
@@ -7240,48 +6565,12 @@ def _compact_item_to_raw_question(
             QUESTION_RELATION_CAUSE,
             QUESTION_RELATION_EFFECT,
         }:
-            repaired_question_text = (
-                _deterministic_high_risk_relation_repair(
-                    question_text=question_text,
-                    answer_text=answer_text,
-                    evidence_quote=evidence_quote,
-                )
+            raise ValueError(
+                "V6 compact question uses a "
+                "high-risk semantic relation; "
+                "use a direct FACT/DEFINITION/"
+                "FORMULA question instead"
             )
-
-            if repaired_question_text is None:
-                raise ValueError(
-                    "V6 compact question uses a "
-                    "high-risk semantic relation and "
-                    "deterministic repair could not "
-                    "produce a direct grounded stem"
-                )
-
-            print(
-                "[QUIZ QUALITY] "
-                f"slot={slot_id} "
-                "high-risk relation repaired "
-                f"deterministically: {relation}"
-            )
-
-            question_text = repaired_question_text
-
-            repaired_relation = (
-                _detect_question_relation(
-                    question_text
-                )
-            )
-
-            if repaired_relation in {
-                QUESTION_RELATION_PURPOSE,
-                QUESTION_RELATION_REQUIREMENT,
-                QUESTION_RELATION_CAUSE,
-                QUESTION_RELATION_EFFECT,
-            }:
-                raise ValueError(
-                    "High-risk relation repair "
-                    "did not produce a safe "
-                    "FACT/DEFINITION/FORMULA stem"
-                )
 
         correct_key = (
             _backend_correct_option_key(
@@ -7647,11 +6936,6 @@ def _parse_compact_slot_response(
         dict,
     ]
     | None = None,
-    distractor_candidates_by_slot: dict[
-        str,
-        list[str],
-    ]
-    | None = None,
 ) -> dict[
     str,
     dict,
@@ -7868,9 +7152,6 @@ def _parse_compact_slot_response(
                     answer_by_slot=(
                         answer_by_slot
                     ),
-                    distractor_candidates_by_slot=(
-                        distractor_candidates_by_slot
-                    ),
                 )
             )
 
@@ -7992,9 +7273,6 @@ def _parse_compact_slot_response(
                     answer_by_slot=(
                         answer_by_slot
                     ),
-                    distractor_candidates_by_slot=(
-                        distractor_candidates_by_slot
-                    ),
                 )
             )
 
@@ -8053,10 +7331,6 @@ def _build_compact_source_catalog(
     dict[
         str,
         dict[str, dict],
-    ],
-    dict[
-        str,
-        list[str],
     ],
 ]:
     """
@@ -8271,34 +7545,11 @@ def _build_compact_source_catalog(
             ]
         )
 
-    distractor_candidates_by_slot: dict[
-        str,
-        list[str],
-    ] = {}
-
-    for spec in slot_specs:
-        slot_id = str(
-            spec[
-                "id"
-            ]
-        )
-
-        distractor_candidates_by_slot[
-            slot_id
-        ] = list(
-            spec.get(
-                "extra_distractor_candidates",
-                [],
-            )
-            or []
-        )
-
     return (
         sources,
         slots,
         evidence_by_slot,
         answer_by_slot,
-        distractor_candidates_by_slot,
     )
 
 
@@ -8334,7 +7585,6 @@ def _generate_compact_slot_questions(
         slots,
         evidence_by_slot,
         answer_by_slot,
-        distractor_candidates_by_slot,
     ) = _build_compact_source_catalog(
         slot_specs
     )
@@ -8599,9 +7849,6 @@ STRICT RULES:
             ),
             fixed_choice_by_slot=(
                 fixed_choice_by_slot
-            ),
-            distractor_candidates_by_slot=(
-                distractor_candidates_by_slot
             ),
         )
     )
@@ -9015,29 +8262,6 @@ def _prepare_question_local(
     question = QuestionCreate.model_validate(
         normalized
     )
-
-    (
-        question,
-        formula_options_normalized,
-        formula_stem_contextualized,
-    ) = _final_formula_normalization(
-        question,
-        evidence_quote=(
-            evidence_quote
-        ),
-    )
-
-    if (
-        formula_options_normalized
-        or formula_stem_contextualized
-    ):
-        print(
-            "[QUIZ QUALITY] "
-            "final formula normalization "
-            f"options={formula_options_normalized} "
-            "contextualized="
-            f"{formula_stem_contextualized}"
-        )
 
     _validate_question_quality(
         question
@@ -11370,9 +10594,7 @@ def generate_quiz(
             == "READY",
             Document.owner_id
             == owner_id,
-            DocumentChunk.is_active.is_(
-                True
-            ),
+            DocumentChunk.is_active.is_(True),
         )
     )
 
@@ -11557,12 +10779,6 @@ def generate_quiz(
         dict
     ] = []
 
-    section_distractor_pool = (
-        _build_section_distractor_pool(
-            all_chunks
-        )
-    )
-
     for (
         source_chunk,
         questions_for_chunk,
@@ -11601,17 +10817,6 @@ def generate_quiz(
                     ),
                     "source_text": (
                         source_text
-                    ),
-                    "extra_distractor_candidates": (
-                        section_distractor_pool.get(
-                            int(
-                                source_chunk.section_id
-                            )
-                            if source_chunk.section_id
-                            is not None
-                            else -1,
-                            [],
-                        )
                     ),
                 }
             )
@@ -13354,14 +12559,6 @@ def generate_quiz(
         f"{OPTION_SHAPE_VERSION}; "
         f"label_shape_version="
         f"{LABEL_SHAPE_VERSION}; "
-        f"distractor_pool_version="
-        f"{DISTRACTOR_POOL_VERSION}; "
-        f"high_risk_repair_version="
-        f"{HIGH_RISK_REPAIR_VERSION}; "
-        f"cloze_relation_precedence_version="
-        f"{CLOZE_RELATION_PRECEDENCE_VERSION}; "
-        f"final_formula_normalization_version="
-        f"{FINAL_FORMULA_NORMALIZATION_VERSION}; "
         f"answer_intrinsic_quality_version="
         f"{ANSWER_INTRINSIC_QUALITY_VERSION}; "
         f"language_fit_version="

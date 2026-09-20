@@ -146,7 +146,17 @@ def process(document_id: int, db: DbSession, user: CurrentUser):
 @router.get("/{document_id}/chunks", response_model=list[ChunkOut])
 def document_chunks(document_id: int, db: DbSession, user: CurrentUser, limit: int = 200):
     owned_document(db, user.id, document_id)
-    return list(db.scalars(select(DocumentChunk).where(DocumentChunk.document_id == document_id).order_by(DocumentChunk.chunk_index).limit(limit)).all())
+    return list(
+        db.scalars(
+            select(DocumentChunk)
+            .where(
+                DocumentChunk.document_id == document_id,
+                DocumentChunk.is_active.is_(True),
+            )
+            .order_by(DocumentChunk.chunk_index)
+            .limit(limit)
+        ).all()
+    )
 
 
 @router.delete("/{document_id}", response_model=MessageResponse)

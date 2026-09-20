@@ -1,5 +1,5 @@
 from __future__ import annotations
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 import pymupdf
 import hashlib
@@ -17,8 +17,18 @@ from sqlalchemy import delete, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import ChunkEmbedding, Document, DocumentChunk, DocumentProcessingJob
+from app.db.models import (
+    ChunkEmbedding,
+    Document,
+    DocumentChunk,
+    DocumentProcessingJob,
+    DocumentSection,
+)
 from app.services.ai_provider import AIProviderError, get_ai_provider
+from app.services.structural_chunker import (
+    SSA_SBC_VERSION,
+    structural_chunk_text,
+)
 
 settings = get_settings()
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md"}
@@ -46,7 +56,8 @@ def embed_existing_chunks(
         db.scalars(
             select(DocumentChunk)
             .where(
-                DocumentChunk.document_id == document_id
+                DocumentChunk.document_id == document_id,
+                DocumentChunk.is_active.is_(True),
             )
             .order_by(
                 DocumentChunk.chunk_index
@@ -368,51 +379,185 @@ def process_document(db: Session, doc: Document) -> tuple[int, int]:
 
         job.stage = "CHUNK"
         job.progress_pct = 35
-        db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == doc.id))
-        db.flush()
 
-        chunks = chunk_text(cleaned)
+        sections = list(
+            db.scalars(
+                select(DocumentSection)
+                .where(
+                    DocumentSection.document_id == doc.id
+                )
+                .order_by(
+                    DocumentSection.section_order,
+                    DocumentSection.id,
+                )
+            ).all()
+        )
+
+        structural_chunks = structural_chunk_text(
+            cleaned,
+            sections=sections,
+            size=settings.chunk_size_chars,
+            overlap=settings.chunk_overlap_chars,
+        )
+
+        if not structural_chunks:
+            raise ValueError(
+                "SSA-SBC-V1 produced no document chunks"
+            )
+
+        chunk_set_id = (
+            f"{SSA_SBC_VERSION}-"
+            f"{uuid.uuid4().hex[:16]}"
+        )
+
         chunk_rows: list[DocumentChunk] = []
-        for index, content in enumerate(chunks):
+
+        for index, item in enumerate(structural_chunks):
             row = DocumentChunk(
                 document_id=doc.id,
+                section_id=item.section_id,
                 chunk_index=index,
-                content=content,
-                char_count=len(content),
-                token_count=max(1, len(content) // 4),
-                content_hash=hashlib.sha256(content.encode()).hexdigest(),
-                metadata_={},
+                chunk_set_id=chunk_set_id,
+                chunking_algorithm=SSA_SBC_VERSION,
+                is_active=False,
+                content=item.content,
+                char_count=len(item.content),
+                token_count=max(1, len(item.content) // 4),
+                content_hash=hashlib.sha256(
+                    item.content.encode()
+                ).hexdigest(),
+                metadata_={
+                    "chunking_algorithm": SSA_SBC_VERSION,
+                    "chunk_set_id": chunk_set_id,
+                    "structural_block_index": item.block_index,
+                    "structural_heading": item.structural_heading,
+                    "block_char_start": item.block_char_start,
+                    "block_char_end": item.block_char_end,
+                },
             )
             db.add(row)
             chunk_rows.append(row)
+
         db.flush()
 
         embeddings_created = 0
         provider = get_ai_provider()
+
         if provider.can_embed and chunk_rows:
             job.stage = "EMBED"
             job.progress_pct = 70
+
             for start in range(0, len(chunk_rows), 32):
                 batch = chunk_rows[start:start + 32]
-                vectors = provider.embeddings([c.content for c in batch])
+                vectors = provider.embeddings(
+                    [chunk.content for chunk in batch]
+                )
+
                 if len(vectors) != len(batch):
-                    raise ValueError("Embedding provider returned an unexpected number of vectors")
+                    raise ValueError(
+                        "Embedding provider returned "
+                        "an unexpected number of vectors"
+                    )
+
                 for chunk, vector in zip(batch, vectors):
                     emb = ChunkEmbedding(
                         chunk_id=chunk.id,
-                        embedding_model=settings.ai_embedding_model or "unknown",
+                        embedding_model=(
+                            settings.ai_embedding_model
+                            or "unknown"
+                        ),
                         embedding_dimension=len(vector),
                         embedding_json=vector,
                     )
                     db.add(emb)
                     db.flush()
+
                     if _pgvector_enabled(db):
-                        vector_literal = "[" + ",".join(f"{float(v):.10g}" for v in vector) + "]"
-                        db.execute(
-                            text("UPDATE chunk_embeddings SET embedding = CAST(:v AS vector) WHERE id = :id"),
-                            {"v": vector_literal, "id": emb.id},
+                        vector_literal = (
+                            "["
+                            + ",".join(
+                                f"{float(value):.10g}"
+                                for value in vector
+                            )
+                            + "]"
                         )
+                        db.execute(
+                            text(
+                                "UPDATE chunk_embeddings "
+                                "SET embedding = CAST(:v AS vector) "
+                                "WHERE id = :id"
+                            ),
+                            {
+                                "v": vector_literal,
+                                "id": emb.id,
+                            },
+                        )
+
                     embeddings_created += 1
+
+        if (
+            provider.can_embed
+            and embeddings_created != len(chunk_rows)
+        ):
+            raise ValueError(
+                "New chunk set is incomplete: "
+                "not every chunk has an embedding"
+            )
+
+        hard_heading_re = re.compile(
+            r"(?im)^\s*"
+            r"(?:CHƯƠNG|CHUONG|CHAPTER|PHẦN|PHAN|PART)"
+            r"\s+(?:\d+|[IVXLCDM]+)"
+        )
+
+        for row in chunk_rows:
+            if len(
+                hard_heading_re.findall(row.content)
+            ) > 1:
+                raise ValueError(
+                    "SSA-SBC-V1 boundary validation failed: "
+                    "one chunk contains multiple hard "
+                    "structural headings"
+                )
+
+        switched_at = datetime.now(timezone.utc)
+
+        db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == doc.id,
+            DocumentChunk.is_active.is_(True),
+        ).update(
+            {
+                DocumentChunk.is_active: False,
+                DocumentChunk.superseded_at: switched_at,
+            },
+            synchronize_session=False,
+        )
+
+        db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == doc.id,
+            DocumentChunk.chunk_set_id == chunk_set_id,
+        ).update(
+            {
+                DocumentChunk.is_active: True,
+                DocumentChunk.superseded_at: None,
+            },
+            synchronize_session=False,
+        )
+
+        db.flush()
+
+        active_count = db.scalar(
+            select(func.count(DocumentChunk.id)).where(
+                DocumentChunk.document_id == doc.id,
+                DocumentChunk.chunk_set_id == chunk_set_id,
+                DocumentChunk.is_active.is_(True),
+            )
+        )
+
+        if int(active_count or 0) != len(chunk_rows):
+            raise ValueError(
+                "Atomic chunk-set switch validation failed"
+            )
 
         doc.page_count = pages
         doc.status = "READY"
@@ -422,7 +567,7 @@ def process_document(db: Session, doc: Document) -> tuple[int, int]:
         job.progress_pct = 100
         job.completed_at = datetime.now(timezone.utc)
         db.commit()
-        return len(chunks), embeddings_created
+        return len(chunk_rows), embeddings_created
     except Exception as exc:
         db.rollback()
         doc = db.get(Document, doc.id)

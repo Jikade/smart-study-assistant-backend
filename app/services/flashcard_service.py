@@ -56,7 +56,17 @@ def generate_deck(db: Session, owner_id: int, payload: DeckGenerateRequest) -> F
     provider = get_ai_provider()
     if not provider.can_chat:
         raise HTTPException(503, "AI chat model is not configured")
-    stmt = select(DocumentChunk).join(Document, Document.id == DocumentChunk.document_id).where(Document.status == "READY")
+    stmt = (
+        select(DocumentChunk)
+        .join(
+            Document,
+            Document.id == DocumentChunk.document_id,
+        )
+        .where(
+            Document.status == "READY",
+            DocumentChunk.is_active.is_(True),
+        )
+    )
     if payload.document_ids:
         stmt = stmt.where(DocumentChunk.document_id.in_(payload.document_ids))
     elif payload.subject_id:

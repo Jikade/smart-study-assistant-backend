@@ -155,6 +155,25 @@ class DocumentChunk(Base):
     document_id = mapped_column(BigInteger, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
     section_id = mapped_column(BigInteger, ForeignKey("document_sections.id", ondelete="SET NULL"), nullable=True)
     chunk_index = mapped_column(Integer, nullable=False)
+    chunk_set_id = mapped_column(
+        String(80),
+        nullable=False,
+        server_default=text("'legacy-v1'"),
+    )
+    chunking_algorithm = mapped_column(
+        String(50),
+        nullable=False,
+        server_default=text("'legacy-v1'"),
+    )
+    is_active = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("TRUE"),
+    )
+    superseded_at = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     content = mapped_column(Text, nullable=False)
     token_count = mapped_column(Integer, nullable=True)
     char_count = mapped_column(Integer, nullable=True)

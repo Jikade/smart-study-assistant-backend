@@ -86,7 +86,8 @@ def retrieve_chunks(db: Session, conversation: Conversation, query: str, top_k: 
                     ON dc.id = ce.chunk_id
                 JOIN documents d
                     ON d.id = dc.document_id
-                WHERE {' AND '.join(filters)}
+                WHERE dc.is_active = TRUE
+                AND {' AND '.join(filters)}
                 AND ce.embedding IS NOT NULL
                 ORDER BY
                     ce.embedding
@@ -138,7 +139,8 @@ def retrieve_chunks(db: Session, conversation: Conversation, query: str, top_k: 
                ts_rank_cd(dc.search_vector, plainto_tsquery('simple', :query)) AS score
         FROM document_chunks dc
         JOIN documents d ON d.id = dc.document_id
-        WHERE {' AND '.join(filters)}
+        WHERE dc.is_active = TRUE
+          AND {' AND '.join(filters)}
           AND dc.search_vector @@ plainto_tsquery('simple', :query)
         ORDER BY score DESC, dc.id
         LIMIT :limit
@@ -150,7 +152,9 @@ def retrieve_chunks(db: Session, conversation: Conversation, query: str, top_k: 
             SELECT dc.id, dc.document_id, dc.content, 0.01::float AS score
             FROM document_chunks dc
             JOIN documents d ON d.id = dc.document_id
-            WHERE {' AND '.join(filters)} AND dc.content ILIKE :like_query
+            WHERE dc.is_active = TRUE
+              AND {' AND '.join(filters)}
+              AND dc.content ILIKE :like_query
             ORDER BY dc.id
             LIMIT :limit
         """)
