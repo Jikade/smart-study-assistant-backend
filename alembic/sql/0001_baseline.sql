@@ -3147,8 +3147,3 @@ ALTER TABLE ONLY public.xp_transactions
 
 \unrestrict bUX7q1RdSbHHuPnU2Jm83h596ygpvBmIvJrqaTg1H0dRJL7aoWu2g3G2QnP7WrE
 
--- Active versioned-chunk lookup index.
-CREATE INDEX IF NOT EXISTS ix_document_chunks_active_document
-ON public.document_chunks
-USING btree (document_id, is_active, chunk_index);
-

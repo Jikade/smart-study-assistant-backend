@@ -42,6 +42,11 @@ from app.services.gamification_service import (
     add_xp,
     evaluate_badges,
 )
+from app.services.source_access import (
+    validate_owned_active_chunk_ids,
+    validate_owned_document_ids,
+    validate_owned_subject_id,
+)
 
 OPTION_KEYS = ("A", "B", "C", "D")
 
@@ -199,6 +204,31 @@ def create_quiz(
     ai_model: str | None = None,
     generation_prompt: str | None = None,
 ) -> Quiz:
+    validate_owned_subject_id(
+        db,
+        owner_id,
+        payload.subject_id,
+    )
+
+    document_ids = validate_owned_document_ids(
+        db,
+        owner_id,
+        payload.document_ids,
+        subject_id=payload.subject_id,
+    )
+
+    validate_owned_active_chunk_ids(
+        db,
+        owner_id,
+        [
+            question.source_chunk_id
+            for question in payload.questions
+            if question.source_chunk_id is not None
+        ],
+        allowed_document_ids=document_ids or None,
+        subject_id=payload.subject_id,
+    )
+
     quiz = Quiz(
         owner_id=owner_id,
         subject_id=payload.subject_id,
@@ -217,7 +247,7 @@ def create_quiz(
     db.add(quiz)
     db.flush()
 
-    for document_id in payload.document_ids:
+    for document_id in document_ids:
         db.add(
             QuizDocument(
                 quiz_id=quiz.id,
@@ -11204,6 +11234,12 @@ def generate_quiz(
     *,
     allowed_section_ids: list[int] | None = None,
 ) -> Quiz:
+    validate_owned_subject_id(
+        db,
+        owner_id,
+        payload.subject_id,
+    )
+
     """
     PERFORMANCE V1 + SEMANTIC V2.6
 
@@ -13546,6 +13582,12 @@ def generate_weak_topic_quiz(
     owner_id: int,
     payload: QuizGenerateRequest,
 ) -> Quiz:
+    validate_owned_subject_id(
+        db,
+        owner_id,
+        payload.subject_id,
+    )
+
 
     # =====================================================
     # 1. SUBJECT IS REQUIRED
@@ -13621,6 +13663,12 @@ def generate_adaptive_quiz(
     owner_id: int,
     payload: QuizGenerateRequest,
 ) -> Quiz:
+    validate_owned_subject_id(
+        db,
+        owner_id,
+        payload.subject_id,
+    )
+
     """
     Generate a personalized quiz using the
     backend Adaptive Practice Recommendation
@@ -13760,6 +13808,12 @@ def generate_due_quiz(
     owner_id: int,
     payload: QuizGenerateRequest,
 ) -> Quiz:
+    validate_owned_subject_id(
+        db,
+        owner_id,
+        payload.subject_id,
+    )
+
     """
     Generate a quiz only from topics whose
     spaced-practice review time has actually arrived.

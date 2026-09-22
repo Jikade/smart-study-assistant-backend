@@ -43,17 +43,21 @@ def retrieve_chunks(db: Session, conversation: Conversation, query: str, top_k: 
             )
         ).all()
     )
-    params: dict = {"query": query, "limit": top_k}
-    filters = ["d.status = 'READY'"]
+    params: dict = {
+        "query": query,
+        "limit": top_k,
+        "owner_id": conversation.user_id,
+    }
+    filters = [
+        "d.status = 'READY'",
+        "d.owner_id = :owner_id",
+    ]
     if document_ids:
         filters.append("dc.document_id = ANY(:doc_ids)")
         params["doc_ids"] = document_ids
     elif conversation.subject_id:
         filters.append("d.subject_id = :subject_id")
         params["subject_id"] = conversation.subject_id
-    else:
-        filters.append("d.owner_id = :owner_id")
-        params["owner_id"] = conversation.user_id
 
     provider = get_ai_provider()
     if provider.can_embed and _vector_available(db):

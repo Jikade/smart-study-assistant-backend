@@ -8,9 +8,16 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Document, DocumentSection, StudyPlan, StudyTask
 from app.schemas.study_plans import StudyPlanGenerateRequest
+from app.services.source_access import validate_owned_subject_id
 
 
 def generate_plan(db: Session, user_id: int, payload: StudyPlanGenerateRequest) -> StudyPlan:
+    validate_owned_subject_id(
+        db,
+        user_id,
+        payload.subject_id,
+    )
+
     if payload.exam_date < payload.start_date:
         raise HTTPException(400, "exam_date must be on or after start_date")
     plan = StudyPlan(

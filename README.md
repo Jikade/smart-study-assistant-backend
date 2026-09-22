@@ -334,7 +334,7 @@ Schema SQL hiện tại là **baseline authority**, vì nó chứa trigger, part
 Sau khi database đã được tạo:
 
 ```powershell
-alembic stamp 0001_baseline
+alembic stamp 0002_versioned_document_chunks
 ```
 
 Từ thời điểm này, dùng Alembic cho thay đổi mới. Không chạy `Base.metadata.create_all()` để thay thế `database/schema.sql`.

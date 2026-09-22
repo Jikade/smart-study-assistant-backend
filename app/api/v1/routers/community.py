@@ -83,7 +83,8 @@ def fork(post_id: int, db: DbSession, user: CurrentUser):
         new = Quiz(owner_id=user.id, subject_id=None, source_quiz_id=src.id, title=f"{src.title} (fork)", description=src.description, generation_mode="FORKED", difficulty=src.difficulty, duration_minutes=src.duration_minutes, status="DRAFT", visibility="PRIVATE")
         db.add(new); db.flush()
         for q in db.scalars(select(Question).where(Question.quiz_id == src.id).order_by(Question.question_order)).all():
-            nq = Question(quiz_id=new.id, source_chunk_id=q.source_chunk_id, question_order=q.question_order, question_text=q.question_text, difficulty=q.difficulty, explanation=q.explanation, points=q.points, metadata_={})
+            nq = Question(quiz_id=new.id, # A community fork copies the public quiz content, not the source-document ownership link.
+                source_chunk_id=None, question_order=q.question_order, question_text=q.question_text, difficulty=q.difficulty, explanation=q.explanation, points=q.points, metadata_={})
             db.add(nq); db.flush()
             for o in db.scalars(select(QuestionOption).where(QuestionOption.question_id == q.id).order_by(QuestionOption.position)).all():
                 db.add(QuestionOption(question_id=nq.id, option_key=o.option_key, option_text=o.option_text, is_correct=o.is_correct, explanation=o.explanation, position=o.position))
@@ -92,5 +93,6 @@ def fork(post_id: int, db: DbSession, user: CurrentUser):
     new = FlashcardDeck(owner_id=user.id, source_deck_id=src.id, title=f"{src.title} (fork)", description=src.description, generation_mode="FORKED", visibility="PRIVATE", status="ACTIVE")
     db.add(new); db.flush()
     for c in db.scalars(select(Flashcard).where(Flashcard.deck_id == src.id).order_by(Flashcard.card_order)).all():
-        db.add(Flashcard(deck_id=new.id, source_chunk_id=c.source_chunk_id, front_text=c.front_text, back_text=c.back_text, hint=c.hint, card_order=c.card_order))
+        db.add(Flashcard(deck_id=new.id, # A community fork copies the public card content, not the source-document ownership link.
+            source_chunk_id=None, front_text=c.front_text, back_text=c.back_text, hint=c.hint, card_order=c.card_order))
     db.commit(); return {"resource_type": "FLASHCARD_DECK", "resource_id": new.id}

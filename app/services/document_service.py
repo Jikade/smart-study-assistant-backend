@@ -365,6 +365,18 @@ def _pgvector_enabled(db: Session) -> bool:
 
 
 def process_document(db: Session, doc: Document) -> tuple[int, int]:
+    # Preserve the last usable state before re-indexing.
+    previous_status = str(doc.status or "UPLOADED")
+    previous_active_count = int(
+        db.scalar(
+            select(func.count(DocumentChunk.id)).where(
+                DocumentChunk.document_id == doc.id,
+                DocumentChunk.is_active.is_(True),
+            )
+        )
+        or 0
+    )
+
     job = DocumentProcessingJob(document_id=doc.id, stage="EXTRACT", status="RUNNING", progress_pct=0)
     db.add(job)
     doc.status = "PROCESSING"
@@ -572,7 +584,25 @@ def process_document(db: Session, doc: Document) -> tuple[int, int]:
         db.rollback()
         doc = db.get(Document, doc.id)
         if doc:
-            doc.status = "FAILED"
+            active_count_after_rollback = int(
+                db.scalar(
+                    select(func.count(DocumentChunk.id)).where(
+                        DocumentChunk.document_id == doc.id,
+                        DocumentChunk.is_active.is_(True),
+                    )
+                )
+                or 0
+            )
+
+            if (
+                previous_status == "READY"
+                and previous_active_count > 0
+                and active_count_after_rollback > 0
+            ):
+                doc.status = "READY"
+            else:
+                doc.status = "FAILED"
+
             doc.processing_error = str(exc)
         job = db.get(DocumentProcessingJob, job.id)
         if job:

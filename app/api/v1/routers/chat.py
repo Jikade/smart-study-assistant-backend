@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DbSession
-from app.db.models import Conversation, ConversationDocument, Document, Message
+from app.db.models import Conversation, ConversationDocument, Document, Message, Subject
 from app.schemas.chat import AskRequest, ChatAnswer, ConversationCreate, ConversationOut, MessageOut
 from app.services.rag_service import answer_question
 
@@ -20,6 +20,16 @@ def owned_conversation(db: DbSession, user_id: int, conversation_id: int) -> Con
 
 @router.post("/conversations", response_model=ConversationOut, status_code=201)
 def create_conversation(payload: ConversationCreate, db: DbSession, user: CurrentUser):
+    if payload.subject_id is not None:
+        owned_subject = db.scalar(
+            select(Subject.id).where(
+                Subject.id == payload.subject_id,
+                Subject.owner_id == user.id,
+            )
+        )
+        if owned_subject is None:
+            raise HTTPException(404, "Subject not found")
+
     row = Conversation(user_id=user.id, subject_id=payload.subject_id, title=payload.title)
     db.add(row); db.flush()
     if payload.document_ids:

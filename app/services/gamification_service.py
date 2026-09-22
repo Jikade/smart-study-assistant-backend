@@ -101,12 +101,13 @@ def get_or_create_daily_stat(
     activity_date: date | None = None,
 ) -> DailyLearningStat:
     """
-    Safely get/create a DailyLearningStat.
+    Return exactly one DailyLearningStat for
+    (user_id, activity_date).
 
-    IMPORTANT:
-    Do not use db.get() with a composite-key tuple here,
-    because incorrect PK ordering can cause SQLAlchemy to
-    miss an existing row and attempt a duplicate INSERT.
+    Safe when Session.autoflush is disabled:
+    pending ORM objects are checked before querying
+    the database, preventing duplicate rows for the
+    composite primary key.
     """
 
     target_date = (
@@ -114,6 +115,21 @@ def get_or_create_daily_stat(
         or date.today()
     )
 
+    # 1) Reuse a matching pending object in this Session.
+    for pending in db.new:
+        if not isinstance(
+            pending,
+            DailyLearningStat,
+        ):
+            continue
+
+        if (
+            int(pending.user_id) == int(user_id)
+            and pending.activity_date == target_date
+        ):
+            return pending
+
+    # 2) Query an already-persisted row explicitly by columns.
     stat = db.scalar(
         select(DailyLearningStat)
         .where(
@@ -124,25 +140,19 @@ def get_or_create_daily_stat(
         )
     )
 
-    if stat is None:
-        stat = DailyLearningStat(
-            user_id=user_id,
-            activity_date=target_date,
-        )
+    if stat is not None:
+        return stat
 
-        db.add(stat)
+    # 3) Create one canonical row and flush immediately.
+    stat = DailyLearningStat(
+        user_id=user_id,
+        activity_date=target_date,
+    )
 
-        # Flush now so later services in the same
-        # transaction see the row as existing.
-        db.flush()
+    db.add(stat)
+    db.flush()
 
     return stat
-
-
-# =========================================================
-# XP
-# =========================================================
-
 
 def add_xp(
     db: Session,
