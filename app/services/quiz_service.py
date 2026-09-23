@@ -7822,10 +7822,51 @@ def _parse_compact_slot_response(
             continue
 
         if raw_slot not in expected_set:
-            raise ValueError(
-                "Compact response contains "
-                f"unexpected slot '{raw_slot}'"
-            )
+            # Narrow compatibility recovery:
+            #
+            # Historically the compact-generation prompt
+            # showed literal slot "0" in its JSON example.
+            # Qwen may copy that literal during a request
+            # containing exactly one different backend slot.
+            #
+            # Remap ONLY when the mapping is unambiguous:
+            # - exactly one backend-owned expected slot;
+            # - exactly one returned item;
+            # - model returned the legacy example slot "0";
+            # - expected slot is not itself "0".
+            #
+            # Multi-slot responses remain strictly validated.
+            if (
+                len(expected) == 1
+                and len(raw_items) == 1
+                and raw_slot == "0"
+                and expected[0] != "0"
+            ):
+                recovered_slot = expected[0]
+
+                print(
+                    "[QUIZ JSON] "
+                    "single-slot legacy slot remap "
+                    f"model_slot=0 "
+                    f"expected_slot={recovered_slot}"
+                )
+
+                raw_slot = recovered_slot
+
+                # Keep the copied item internally consistent
+                # with the backend-owned slot identity.
+                raw_item = dict(
+                    raw_item
+                )
+                raw_item[
+                    "slot"
+                ] = raw_slot
+
+            else:
+                raise ValueError(
+                    "Compact response contains "
+                    f"unexpected slot '{raw_slot}'"
+                )
 
         if raw_slot in result:
             raise ValueError(
@@ -8492,6 +8533,10 @@ RETRY_CONTEXT:
             }
         )
 
+    example_slot = str(
+        task_rows[0]["slot"]
+    )
+
     prompt = f"""
 Create exactly ONE direct multiple-choice question
 for EVERY task below.
@@ -8512,7 +8557,7 @@ Return JSON ONLY:
 {{
   "items": [
     {{
-      "slot": "0",
+      "slot": "{example_slot}",
       "q": "question",
       "d": ["wrong 1","wrong 2","wrong 3"]
     }}
@@ -8521,7 +8566,7 @@ Return JSON ONLY:
 
 STRICT RULES:
 - return one item for every task;
-- copy each slot exactly;
+- copy each slot exactly from TASKS;
 - q must be <= 20 words;
 - the supplied correct_answer is fixed by backend;
 - if language is VI, write q and d in Vietnamese;
@@ -11802,63 +11847,130 @@ def generate_quiz(
             ]
         )
 
-        try:
-            (
-                single_raw_by_slot,
-                single_model,
-                single_ms,
-            ) = (
-                _generate_compact_slot_questions(
-                    provider,
-                    slot_specs=[
-                        missing_spec
-                    ],
-                    difficulty=(
-                        payload.difficulty
-                    ),
-                    allow_partial_response=False,
-                )
+        single_raw_by_slot = None
+        single_model = None
+        single_ms = 0.0
+        last_single_error: Exception | None = None
+
+        for recovery_attempt in range(
+            INITIAL_JSON_MAX_RETRIES + 1
+        ):
+            attempt_started = (
+                time.perf_counter()
             )
 
-        except AIProviderError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Initial single-slot recovery "
-                    f"failed for slot {missing_slot_id}: "
-                    f"{exc}"
-                ),
-            ) from exc
+            try:
+                (
+                    single_raw_by_slot,
+                    single_model,
+                    single_ms,
+                ) = (
+                    _generate_compact_slot_questions(
+                        provider,
+                        slot_specs=[
+                            missing_spec
+                        ],
+                        difficulty=(
+                            payload.difficulty
+                        ),
+                        allow_partial_response=False,
+                    )
+                )
 
-        except (
-            json.JSONDecodeError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ) as exc:
+                initial_single_recovery_calls += 1
+                perf_initial_generation_ms += (
+                    single_ms
+                )
+
+                _perf_log(
+                    "quiz_initial_single_recovery",
+                    single_ms,
+                    extra=(
+                        f"slot={missing_slot_id} "
+                        f"attempt={recovery_attempt + 1}/"
+                        f"{INITIAL_JSON_MAX_RETRIES + 1}"
+                    ),
+                )
+
+                last_single_error = None
+                break
+
+            except AIProviderError as exc:
+                initial_single_recovery_calls += 1
+                failed_ms = _perf_ms(
+                    attempt_started
+                )
+                perf_initial_generation_ms += (
+                    failed_ms
+                )
+
+                print(
+                    "[QUIZ JSON] "
+                    "initial single-slot recovery "
+                    "provider failure "
+                    f"slot={missing_slot_id} "
+                    f"attempt={recovery_attempt + 1}/"
+                    f"{INITIAL_JSON_MAX_RETRIES + 1}: "
+                    f"{exc}"
+                )
+
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Initial single-slot recovery "
+                        f"failed for slot {missing_slot_id}: "
+                        f"{exc}"
+                    ),
+                ) from exc
+
+            except (
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                initial_single_recovery_calls += 1
+                failed_ms = _perf_ms(
+                    attempt_started
+                )
+                perf_initial_generation_ms += (
+                    failed_ms
+                )
+                last_single_error = exc
+
+                print(
+                    "[QUIZ JSON] "
+                    "initial single-slot recovery "
+                    "invalid JSON/schema "
+                    f"slot={missing_slot_id} "
+                    f"attempt={recovery_attempt + 1}/"
+                    f"{INITIAL_JSON_MAX_RETRIES + 1}: "
+                    f"{exc}"
+                )
+
+                if (
+                    recovery_attempt
+                    >= INITIAL_JSON_MAX_RETRIES
+                ):
+                    break
+
+                initial_json_retries_used += 1
+
+        if (
+            single_raw_by_slot is None
+            or last_single_error is not None
+        ):
             raise HTTPException(
                 status_code=502,
                 detail=(
                     "Initial single-slot recovery "
                     "returned invalid JSON/schema "
-                    f"for slot {missing_slot_id}: "
-                    f"{exc}"
+                    f"for slot {missing_slot_id} "
+                    f"after {INITIAL_JSON_MAX_RETRIES + 1} "
+                    "attempt(s): "
+                    f"{last_single_error}"
                 ),
-            ) from exc
-
-        initial_single_recovery_calls += 1
-
-        perf_initial_generation_ms += (
-            single_ms
-        )
-
-        _perf_log(
-            "quiz_initial_single_recovery",
-            single_ms,
-            extra=(
-                f"slot={missing_slot_id}"
-            ),
-        )
+            ) from last_single_error
 
         ai_model_name = (
             single_model
@@ -11868,7 +11980,6 @@ def generate_quiz(
         raw_by_slot.update(
             single_raw_by_slot
         )
-
     missing_after_recovery = [
         str(
             spec[
