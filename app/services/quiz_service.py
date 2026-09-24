@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from time import perf_counter
+
 import json
 import re
 import time
@@ -46,6 +48,26 @@ from app.services.source_access import (
     validate_owned_active_chunk_ids,
     validate_owned_document_ids,
     validate_owned_subject_id,
+)
+from app.services.quiz_pedagogy import (
+    ACQ_VERSION,
+    DSP_VERSION,
+    PQG_VERSION,
+    QSP_VERSION,
+    acq_answer_issue,
+    acq_score_bonus,
+    pedagogical_question_issue,
+    qsp_chunk_issue,
+    qsp_score,
+)
+
+from app.services.quiz_domain import (
+    DOMAIN_AWARE_QUIZ_VERSION,
+    candidate_compatible_with_profile,
+    infer_knowledge_profile,
+    question_guidance,
+    rank_domain_candidates,
+    structured_distractor_variants,
 )
 
 OPTION_KEYS = ("A", "B", "C", "D")
@@ -104,7 +126,7 @@ MICRO_CONTEXT_MAX_WINDOWS_PER_CHUNK = 8
 
 
 # One compact initial generation call for the whole quiz.
-COMBINED_GENERATION_VERSION = "CG-V1"
+COMBINED_GENERATION_VERSION = "CG-V3"
 
 EVIDENCE_ID_VERSION = "EID-V1.5"
 
@@ -121,6 +143,8 @@ FORMULA_AMBIGUITY_VERSION = "FA-V1"
 OPTION_SHAPE_VERSION = "OS-V1.1"
 LABEL_SHAPE_VERSION = "LS-V1"
 DISTRACTOR_POOL_VERSION = "DP-V1"
+BACKEND_OWNED_DISTRACTORS_VERSION = "BOD-V1"
+GLOBAL_DISTRACTOR_POOL_VERSION = "GDP-V1"
 HIGH_RISK_REPAIR_VERSION = "HRR-V1"
 CLOZE_RELATION_PRECEDENCE_VERSION = "CRP-V1"
 FINAL_FORMULA_NORMALIZATION_VERSION = "FFN-V1"
@@ -132,6 +156,8 @@ ANSWER_SOURCE_FIT_VERSION = "ASF-V1"
 
 # One compact regeneration call for all fast-gate failures.
 FAST_RETRY_VERSION = "FR-V1.2"
+# Pedagogical hardening module:
+# QSP-V1 / ACQ-V1 / PQG-V1 / DSP-V2.
 
 # After Fast Retry + V2.6 batch fallback, do NOT launch
 # another expensive generation/verifier chain.
@@ -139,6 +165,9 @@ FAST_RETRY_VERSION = "FR-V1.2"
 SEMANTIC_POST_FALLBACK_MAX_RETRIES = 0
 
 FAST_RETRY_MAX_BATCH_ITEMS = 3
+SLOT_REPLACEMENT_VERSION = "SRP-V1"
+SLOT_REPLACEMENT_MAX_ATTEMPTS_PER_SLOT = 2
+SLOT_REPLACEMENT_MAX_TOTAL_AI_CALLS = 3
 
 
 # =========================================================
@@ -750,6 +779,10 @@ def _answer_candidate_intrinsic_issue(
     if not norm:
         return "empty normalized answer candidate"
 
+    acq_issue = acq_answer_issue(answer)
+    if acq_issue:
+        return acq_issue
+
     deictic_fragments = {
         "khi đó",
         "lúc đó",
@@ -1329,6 +1362,21 @@ def _question_answer_fit_issue(
         ].option_text
         or ""
     ).strip()
+
+    distractor_texts = [
+        str(option.option_text or "").strip()
+        for option in question.options
+        if not option.is_correct
+    ]
+
+    pedagogy_issue = pedagogical_question_issue(
+        question_text=question_text,
+        correct_text=correct_text,
+        distractors=distractor_texts,
+        evidence_text=evidence_quote,
+    )
+    if pedagogy_issue:
+        return pedagogy_issue
 
     q_norm = _normalize_compare_text(
         question_text
@@ -5388,6 +5436,8 @@ def _score_backend_answer_candidate(
     ):
         score -= 25.0
 
+    score += acq_score_bonus(answer, evidence)
+
     # Prefer concise candidates when semantic quality ties.
     score -= (
         len(
@@ -6205,6 +6255,18 @@ def _build_section_distractor_pool(
             norm = _normalize_compare_text(
                 candidate
             )
+            # DQH-V1 pool ACQ filter:
+            # keep low-quality headings/fragments/generic text
+            # out of section/GDP pools before ranking.
+            pool_quality_issue = (
+                _answer_candidate_intrinsic_issue(
+                    candidate
+                )
+            )
+
+            if pool_quality_issue:
+                continue
+
 
             if (
                 not candidate
@@ -6223,6 +6285,67 @@ def _build_section_distractor_pool(
 
             if len(pool) >= 80:
                 break
+
+    # GDP-V1 request-wide fallback:
+    # preserve same-section candidates first, then append
+    # deterministic candidates collected from other sections.
+    global_pool: list[str] = []
+    global_seen: set[str] = set()
+
+    for section_id in sorted(pools):
+        for candidate in pools[section_id]:
+            candidate_text = str(candidate or "").strip()
+            candidate_norm = _normalize_compare_text(candidate_text)
+
+            if (
+                not candidate_text
+                or not candidate_norm
+                or candidate_norm in global_seen
+            ):
+                continue
+
+            global_seen.add(candidate_norm)
+            global_pool.append(candidate_text)
+
+            if len(global_pool) >= 160:
+                break
+
+        if len(global_pool) >= 160:
+            break
+
+    for section_id in list(pools):
+        section_pool = pools[section_id]
+        section_seen = {
+            _normalize_compare_text(candidate)
+            for candidate in section_pool
+            if str(candidate or "").strip()
+        }
+
+        for candidate in global_pool:
+            candidate_norm = _normalize_compare_text(candidate)
+
+            if (
+                not candidate_norm
+                or candidate_norm in section_seen
+            ):
+                continue
+
+            section_seen.add(candidate_norm)
+            section_pool.append(candidate)
+
+            if len(section_pool) >= 160:
+                break
+
+    # Sources without section_id can use the request-wide pool
+    # through the existing section_distractor_pool.get(-1, []) path.
+    pools[-1] = list(global_pool)
+
+    print(
+        "[QUIZ PEDAGOGY] "
+        "GDP-V1 request-wide fallback "
+        f"candidates={len(global_pool)} "
+        f"sections={len(pools)}"
+    )
 
     return pools
 
@@ -6278,6 +6401,184 @@ def _sanitize_v6_distractors(
 
         if not text:
             return False
+
+        # DSG-V1 distractor surface-quality guard.
+        #
+        # Reject malformed fragments before ACQ/DSP. This targets
+        # extraction artifacts such as:
+        #   "bất động sản)"
+        #   "(khái niệm"
+        # while preserving valid balanced parenthetical labels such as:
+        #   "v (Tư bản khả biến)".
+        bracket_pairs = (
+            ("(", ")"),
+            ("[", "]"),
+            ("{", "}"),
+        )
+
+        if any(
+            text.count(open_char)
+            != text.count(close_char)
+            for open_char, close_char
+            in bracket_pairs
+        ):
+            return False
+
+        if re.search(
+            r"^[\)\]\}]|[\(\[\{]$",
+            text,
+        ):
+            return False
+
+        # Reject obvious trailing extraction debris. Normal
+        # Vietnamese punctuation such as ".", ",", ":" is not
+        # globally forbidden; only orphan bracket-like endings.
+        if re.search(
+            r"[\)\]\}]\s*$",
+            text,
+        ) and not any(
+            (
+                open_char in text
+                and close_char in text
+            )
+            for open_char, close_char
+            in bracket_pairs
+        ):
+            return False
+
+        # DQH-V1 sanitizer ACQ/DSP filter.
+        #
+        # ACQ rejects headings, dangling fragments and
+        # generic pseudo-options before they can become
+        # distractors. DSP then checks semantic/shape
+        # parallelism against the backend-owned correct
+        # answer and already accepted distractors.
+        correct_profile = (
+            infer_knowledge_profile(
+                answer_text=(
+                    answer_text
+                ),
+                evidence_text=(
+                    evidence_quote
+                ),
+            )
+        )
+
+        structured_types = {
+            "DATE",
+            "NUMERIC",
+            "FORMULA",
+            "CHEMICAL_FORMULA",
+            "CHEMICAL_EQUATION",
+        }
+
+        if (
+            correct_profile.knowledge_type
+            in structured_types
+        ):
+            if not (
+                candidate_compatible_with_profile(
+                    text,
+                    correct_profile=(
+                        correct_profile
+                    ),
+                    candidate_context=(
+                        evidence_quote
+                    ),
+                )
+            ):
+                return False
+
+            intrinsic_issue = None
+        else:
+            intrinsic_issue = (
+                _answer_candidate_intrinsic_issue(
+                    text
+                )
+            )
+
+        if intrinsic_issue:
+            return False
+
+        # DQH-V1.1 shape-parallelism guard.
+        #
+        # A multi-word concept answer should not be paired with
+        # a bare one-word distractor such as "mới". This guard is
+        # intentionally relative to the correct-answer shape, so
+        # short/symbolic questions are not globally forbidden.
+        correct_shape_tokens = [
+            token
+            for token in re.findall(
+                r"\w+",
+                _normalize_compare_text(
+                    answer_text
+                ),
+                flags=re.UNICODE,
+            )
+            if token
+        ]
+
+        candidate_shape_tokens = [
+            token
+            for token in re.findall(
+                r"\w+",
+                _normalize_compare_text(
+                    text
+                ),
+                flags=re.UNICODE,
+            )
+            if token
+        ]
+
+        if (
+            len(correct_shape_tokens) >= 2
+            and len(candidate_shape_tokens) <= 1
+        ):
+            return False
+
+        dsp_fn = globals().get(
+            "dsp_distractor_issue"
+        )
+
+        # DQH-V1.2 runtime DSP binding.
+        #
+        # Historical quiz_service imports exposed DSP_VERSION
+        # and pedagogical_question_issue but not the helper
+        # itself. In that case globals().get(...) returned None
+        # and the sanitizer DSP hook silently never ran.
+        if not callable(
+            dsp_fn
+        ):
+            try:
+                from app.services.quiz_pedagogy import (
+                    dsp_distractor_issue as runtime_dsp_distractor_issue,
+                )
+
+                dsp_fn = (
+                    runtime_dsp_distractor_issue
+                )
+            except Exception:
+                dsp_fn = None
+
+        if callable(
+            dsp_fn
+        ):
+            dsp_issue = dsp_fn(
+                correct_text=(
+                    answer_text
+                ),
+                distractors=(
+                    list(
+                        accepted
+                    )
+                    + [
+                        text
+                    ]
+                ),
+            )
+
+            if dsp_issue:
+                return False
 
         correct_is_formula = (
             "=" in str(
@@ -6438,33 +6739,38 @@ def _sanitize_v6_distractors(
         )
     )
 
-    backend_pool.sort(
-        key=lambda value: (
-            (
-                0
-                if (
-                    not label_style
-                    or _looks_like_concept_label(
-                        value
-                    )
-                )
-                else 1
-            ),
-            len(
-                re.findall(
-                    r"\w+",
-                    value,
-                    flags=re.UNICODE,
-                )
-            ),
-            len(
+    # SFR-V1.1 sanitizer-order preservation.
+    #
+    # SDC/SFR already supplies candidates in semantic-priority
+    # order. Do NOT re-sort by token count / string length here,
+    # because that promotes short junk phrases such as
+    # "hiệu lực", "lao động", "Tuy nhiên" ahead of stronger
+    # domain-neighbor distractors.
+    #
+    # For label-style questions only, keep a STABLE partition:
+    # concept labels first, while preserving original order
+    # inside each partition.
+    if label_style:
+        label_candidates = [
+            value
+            for value in backend_pool
+            if _looks_like_concept_label(
                 value
-            ),
-            _normalize_compare_text(
+            )
+        ]
+
+        non_label_candidates = [
+            value
+            for value in backend_pool
+            if not _looks_like_concept_label(
                 value
-            ),
+            )
+        ]
+
+        backend_pool = (
+            label_candidates
+            + non_label_candidates
         )
-    )
 
     for candidate in backend_pool:
         if len(
@@ -7203,8 +7509,12 @@ def _compact_item_to_raw_question(
             )
 
         distractors = item.get(
-            "d"
+            "d",
+            [],
         )
+
+        if distractors is None:
+            distractors = []
 
         if (
             not isinstance(
@@ -7214,11 +7524,14 @@ def _compact_item_to_raw_question(
             or len(
                 distractors
             )
-            != 3
+            not in {
+                0,
+                3,
+            }
         ):
             raise ValueError(
-                "V6 compact item d must contain "
-                "exactly three distractor strings"
+                "V6 compact item d may be omitted/empty "
+                "or contain exactly three distractor strings"
             )
 
         (
@@ -7888,10 +8201,7 @@ def _parse_compact_slot_response(
                 )
             )
 
-            if (
-                fixed_choice
-                and "d" in effective_item
-            ):
+            if fixed_choice:
                 # Backend overwrites any model-selected
                 # evidence/answer IDs.
                 effective_item[
@@ -8014,10 +8324,7 @@ def _parse_compact_slot_response(
                 )
             )
 
-            if (
-                fixed_choice
-                and "d" in effective_item
-            ):
+            if fixed_choice:
                 effective_item[
                     "e"
                 ] = (
@@ -8373,6 +8680,2079 @@ def _build_compact_source_catalog(
     )
 
 
+
+
+SEMANTIC_FALLBACK_RANKING_VERSION = "SFR-V1"
+
+
+def _semantic_fallback_score(
+    candidate: str,
+    *,
+    correct_text: str,
+) -> float:
+    """
+    Deterministic ranking for TERM fallback distractors.
+
+    Goals:
+    - prefer candidates with domain-token overlap;
+    - prefer similar phrase length/shape;
+    - demote unrelated discourse/meta phrases;
+    - never replace ACQ/DSP validation; ranking only changes order.
+    """
+    candidate_text = str(
+        candidate
+        or ""
+    ).strip()
+
+    correct_value = str(
+        correct_text
+        or ""
+    ).strip()
+
+    if (
+        not candidate_text
+        or not correct_value
+    ):
+        return -999.0
+
+    if (
+        _semantic_answer_kind(
+            candidate_text
+        )
+        != _semantic_answer_kind(
+            correct_value
+        )
+    ):
+        return -500.0
+
+    if (
+        _answer_candidate_intrinsic_issue(
+            candidate_text
+        )
+    ):
+        return -400.0
+
+    candidate_norm = (
+        _normalize_compare_text(
+            candidate_text
+        )
+    )
+    correct_norm = (
+        _normalize_compare_text(
+            correct_value
+        )
+    )
+
+    if (
+        not candidate_norm
+        or candidate_norm
+        == correct_norm
+    ):
+        return -999.0
+
+    stop_words = {
+        "a",
+        "b",
+        "c",
+        "d",
+        "là",
+        "và",
+        "của",
+        "các",
+        "những",
+        "một",
+        "về",
+        "theo",
+        "trong",
+        "giữa",
+        "được",
+        "cho",
+        "với",
+        "the",
+        "of",
+        "and",
+        "or",
+        "to",
+        "in",
+        "on",
+        "for",
+    }
+
+    correct_tokens = [
+        token
+        for token in re.findall(
+            r"\w+",
+            correct_norm,
+            flags=re.UNICODE,
+        )
+        if (
+            len(token) >= 2
+            and token not in stop_words
+        )
+    ]
+
+    candidate_tokens = [
+        token
+        for token in re.findall(
+            r"\w+",
+            candidate_norm,
+            flags=re.UNICODE,
+        )
+        if (
+            len(token) >= 2
+            and token not in stop_words
+        )
+    ]
+
+    if (
+        not correct_tokens
+        or not candidate_tokens
+    ):
+        return -100.0
+
+    correct_set = set(
+        correct_tokens
+    )
+    candidate_set = set(
+        candidate_tokens
+    )
+
+    shared = (
+        correct_set
+        & candidate_set
+    )
+
+    union = (
+        correct_set
+        | candidate_set
+    )
+
+    jaccard = (
+        len(shared)
+        / max(
+            1,
+            len(union),
+        )
+    )
+
+    overlap_correct = (
+        len(shared)
+        / max(
+            1,
+            len(correct_set),
+        )
+    )
+
+    length_ratio = (
+        min(
+            len(correct_tokens),
+            len(candidate_tokens),
+        )
+        / max(
+            len(correct_tokens),
+            len(candidate_tokens),
+        )
+    )
+
+    score = (
+        60.0
+        * jaccard
+        + 40.0
+        * overlap_correct
+        + 20.0
+        * length_ratio
+    )
+
+    # Strong structural bonus for sharing the leading domain term,
+    # e.g. "Cạnh tranh giữa các ngành" vs
+    # "Cạnh tranh trong nội bộ ngành".
+    if (
+        correct_tokens
+        and candidate_tokens
+        and correct_tokens[0]
+        == candidate_tokens[0]
+    ):
+        score += 30.0
+
+    # Mild bonus for any shared domain token.
+    score += (
+        8.0
+        * len(shared)
+    )
+
+    # Unrelated short phrases remain eligible only as a last resort.
+    if not shared:
+        score -= 35.0
+
+    return score
+
+
+SEMANTIC_DISTRACTOR_CATALOG_VERSION = "SDC-V1"
+
+
+def _semantic_answer_kind(value: str) -> str:
+    text = str(value or "").strip()
+    return "FORMULA" if "=" in text else "TERM"
+
+
+def _extract_local_label_candidates(
+    source_text: str,
+    *,
+    correct_text: str,
+) -> list[str]:
+    """
+    Extract source-local concept labels from structures like:
+
+      • Thước đo giá trị: Dùng để...
+      2. Phương tiện lưu thông: Làm...
+      Cạnh tranh giữa các ngành: Sự cạnh tranh...
+
+    This is intentionally conservative: only the short label
+    before a colon is considered.
+    """
+    correct_norm = _normalize_compare_text(
+        correct_text
+    )
+
+    candidates: list[str] = []
+    seen: set[str] = {
+        correct_norm
+    }
+
+    for raw_line in str(
+        source_text
+        or ""
+    ).splitlines():
+        line = raw_line.strip()
+
+        if not line or ":" not in line:
+            continue
+
+        label = line.split(
+            ":",
+            1,
+        )[0].strip()
+
+        label = re.sub(
+            r"^\s*(?:[•*+\-]\s*)+",
+            "",
+            label,
+        ).strip()
+
+        label = re.sub(
+            r"^\s*\d+\s*[.)]\s*",
+            "",
+            label,
+        ).strip()
+
+        if not label:
+            continue
+
+        if len(label) < 3 or len(label) > 90:
+            continue
+
+        if "=" in label:
+            # Formula candidates stay in the existing formula
+            # fallback path; this label extractor targets terms.
+            continue
+
+        if _answer_candidate_intrinsic_issue(
+            label
+        ):
+            continue
+
+        # SDC-V1.1 meta-introduction filter.
+        #
+        # Do not treat source-introduction sentences such as:
+        #   "Tiền tệ có 5 chức năng cơ bản:"
+        #   "Các hình thức bao gồm:"
+        # as concept labels.
+        #
+        # These are discourse/meta statements, not answer labels.
+        label_norm_for_meta = (
+            _normalize_compare_text(
+                label
+            )
+        )
+
+        meta_label_patterns = (
+            r"\bcó\s+\d+\s+",
+            r"\bbao\s+gồm\b",
+            r"\bgồm\b",
+            r"\bnhư\s+sau\b",
+            r"\bsau\s+đây\b",
+            r"\bbao\s+gồm\s+các\b",
+        )
+
+        if any(
+            re.search(
+                pattern,
+                label_norm_for_meta,
+                flags=re.UNICODE,
+            )
+            for pattern in meta_label_patterns
+        ):
+            continue
+
+        norm = _normalize_compare_text(
+            label
+        )
+
+        if (
+            not norm
+            or norm in seen
+        ):
+            continue
+
+        seen.add(norm)
+        candidates.append(label)
+
+    return candidates
+
+
+
+def _apply_semantic_distractor_catalog(
+    *,
+    slot_specs: list[dict],
+    fixed_choice_by_slot: dict[str, dict],
+    answer_by_slot: dict[str, dict[str, dict]],
+    distractor_candidates_by_slot: dict[str, list[str]],
+) -> tuple[
+    dict[str, dict[str, dict]],
+    dict[str, list[str]],
+]:
+    # SDC-V1 + DAQ-V1.
+    narrowed_answers: dict[str, dict[str, dict]] = {}
+
+    source_by_slot = {
+        str(spec.get("id")): str(
+            spec.get("source_text", "") or ""
+        )
+        for spec in slot_specs
+    }
+
+    for raw_slot_id, choice in fixed_choice_by_slot.items():
+        slot_id = str(raw_slot_id)
+        answer_id = str(
+            choice.get("answer_id", "") or ""
+        ).strip().upper()
+
+        selected_spec = (
+            (
+                answer_by_slot.get(slot_id, {})
+                or {}
+            ).get(answer_id)
+        )
+
+        if selected_spec is None:
+            selected_spec = {
+                "text": choice.get("answer_text", ""),
+                "evidence_id": choice.get("evidence_id", ""),
+            }
+
+        narrowed_answers[slot_id] = {
+            answer_id: selected_spec
+        }
+
+    catalog: dict[str, list[str]] = {}
+
+    for raw_slot_id, choice in fixed_choice_by_slot.items():
+        slot_id = str(raw_slot_id)
+        correct_text = str(
+            choice.get("answer_text", "") or ""
+        ).strip()
+
+        source_text = source_by_slot.get(slot_id, "")
+        evidence_text = str(
+            choice.get("evidence_text", "") or ""
+        )
+
+        profile = infer_knowledge_profile(
+            answer_text=correct_text,
+            evidence_text=evidence_text,
+            source_text=source_text,
+        )
+
+        local_labels: list[str] = []
+
+        # DAQ-V1.5 typed local-label isolation:
+        # raw "Label: definition" extraction has no per-label
+        # evidence object. It is safe as a TERM pool, but must
+        # not be promoted into PERSON/PLACE/EVENT/PROCESS merely
+        # because another sentence in the same chunk has that cue.
+        if profile.knowledge_type == "TERM":
+            local_labels = _extract_local_label_candidates(
+                source_text,
+                correct_text=correct_text,
+            )
+
+            # DAQ-V1.3 local-label stability:
+            #
+            # Source-local labels already carry strong semantic
+            # structure and document order. Keep that order stable
+            # for backward compatibility with SDC-V1; only filter
+            # by inferred knowledge-type compatibility here.
+            local_labels = [
+                candidate
+                for candidate in local_labels
+                if candidate_compatible_with_profile(
+                    candidate,
+                    correct_profile=profile,
+                    candidate_context=source_text,
+                )
+            ]
+
+        peers: list[str] = []
+
+        for other_raw_slot_id, other_choice in fixed_choice_by_slot.items():
+            other_slot_id = str(other_raw_slot_id)
+
+            if other_slot_id == slot_id:
+                continue
+
+            other_text = str(
+                other_choice.get("answer_text", "") or ""
+            ).strip()
+
+            if not other_text:
+                continue
+
+            other_evidence = str(
+                other_choice.get("evidence_text", "") or ""
+            )
+
+            if not candidate_compatible_with_profile(
+                other_text,
+                correct_profile=profile,
+                candidate_context=other_evidence,
+            ):
+                continue
+
+            if (
+                profile.knowledge_type
+                not in {
+                    "DATE",
+                    "NUMERIC",
+                    "FORMULA",
+                    "CHEMICAL_FORMULA",
+                    "CHEMICAL_EQUATION",
+                }
+                and _answer_candidate_intrinsic_issue(
+                    other_text
+                )
+            ):
+                continue
+
+            peers.append(other_text)
+
+        peers = rank_domain_candidates(
+            peers,
+            correct_text=correct_text,
+            correct_profile=profile,
+            candidate_context=source_text,
+        )
+
+        structured = structured_distractor_variants(
+            correct_text,
+            profile=profile,
+        )
+
+        fallback = list(
+            distractor_candidates_by_slot.get(
+                slot_id,
+                [],
+            )
+            or []
+        )
+
+        fallback = rank_domain_candidates(
+            fallback,
+            correct_text=correct_text,
+            correct_profile=profile,
+            candidate_context=source_text,
+        )
+
+        preferred = (
+            local_labels
+            + peers
+            + structured
+        )
+
+        preferred_unique = {
+            _normalize_compare_text(value)
+            for value in preferred
+            if str(value or "").strip()
+        }
+
+        combined_source = (
+            preferred
+            if len(preferred_unique) >= 3
+            else preferred + fallback
+        )
+
+        merged: list[str] = []
+        seen: set[str] = {
+            _normalize_compare_text(correct_text)
+        }
+
+        for candidate in combined_source:
+            candidate_text = str(
+                candidate or ""
+            ).strip()
+
+            if not candidate_text:
+                continue
+
+            if not candidate_compatible_with_profile(
+                candidate_text,
+                correct_profile=profile,
+                candidate_context=source_text,
+            ):
+                continue
+
+            if (
+                profile.knowledge_type
+                not in {
+                    "DATE",
+                    "NUMERIC",
+                    "FORMULA",
+                    "CHEMICAL_FORMULA",
+                    "CHEMICAL_EQUATION",
+                }
+                and _answer_candidate_intrinsic_issue(
+                    candidate_text
+                )
+            ):
+                continue
+
+            norm = _normalize_compare_text(
+                candidate_text
+            )
+
+            if not norm or norm in seen:
+                continue
+
+            seen.add(norm)
+            merged.append(candidate_text)
+
+        catalog[slot_id] = merged
+
+        print(
+            "[QUIZ PEDAGOGY] "
+            f"{SEMANTIC_DISTRACTOR_CATALOG_VERSION}/"
+            f"{DOMAIN_AWARE_QUIZ_VERSION} "
+            f"slot={slot_id} "
+            f"domain={profile.domain} "
+            f"type={profile.knowledge_type} "
+            f"local={len(local_labels)} "
+            f"peers={len(peers)} "
+            f"structured={len(structured)} "
+            f"candidates={len(merged)}"
+        )
+
+    return narrowed_answers, catalog
+
+
+
+# =========================================================
+# DAQ-V1.4 DISTRACTOR-VIABILITY PREFLIGHT
+# =========================================================
+
+class QuizPreflightCapacityError(HTTPException):
+    """
+    Deterministic quiz-capacity failure.
+
+    This is intentionally an HTTPException rather than ValueError so
+    JSON/schema retry handlers do not mistake a backend preflight
+    failure for malformed AI output and retry the model pointlessly.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            status_code=422,
+            detail=detail,
+        )
+
+
+def _daq_source_chunk_group_key(
+    spec: dict,
+) -> str | None:
+    """
+    DAQ-V1.8:
+    identify micro-contexts that originate from the same
+    backend-owned DocumentChunk without changing source_ref
+    or answer/evidence ownership.
+    """
+    source_chunk = spec.get(
+        "source_chunk"
+    )
+
+    if source_chunk is not None:
+        chunk_id = getattr(
+            source_chunk,
+            "id",
+            None,
+        )
+
+        if chunk_id is not None:
+            return (
+                "chunk:"
+                f"{chunk_id}"
+            )
+
+        return (
+            "object:"
+            f"{id(source_chunk)}"
+        )
+
+    for key in (
+        "source_chunk_id",
+        "chunk_id",
+        "document_chunk_id",
+    ):
+        value = spec.get(
+            key
+        )
+
+        if value is not None:
+            return (
+                f"{key}:"
+                f"{value}"
+            )
+
+    return None
+
+
+def _daq_share_sibling_microcontext_distractors(
+    *,
+    slot_specs: list[dict],
+    answer_by_slot: dict[
+        str,
+        dict[str, dict],
+    ],
+    distractor_candidates_by_slot: dict[
+        str,
+        list[str],
+    ],
+) -> None:
+    """
+    DAQ-V1.8 — sibling micro-context distractor sharing.
+
+    Correct answers and evidence remain local to each slot.
+    Only distractor text candidates are shared between
+    micro-contexts originating from the same source chunk.
+    """
+
+    spec_by_slot = {
+        str(
+            spec.get(
+                "id",
+                "",
+            )
+        ): spec
+        for spec in slot_specs
+    }
+
+    groups: dict[
+        str,
+        list[str],
+    ] = {}
+
+    for (
+        slot_id,
+        spec,
+    ) in spec_by_slot.items():
+        group_key = (
+            _daq_source_chunk_group_key(
+                spec
+            )
+        )
+
+        if not group_key:
+            continue
+
+        groups.setdefault(
+            group_key,
+            [],
+        ).append(
+            slot_id
+        )
+
+    normalize_fn = globals().get(
+        "_normalize_compare_text"
+    )
+
+    for (
+        group_key,
+        group_slots,
+    ) in groups.items():
+        if len(
+            group_slots
+        ) <= 1:
+            continue
+
+        answer_texts_by_slot: dict[
+            str,
+            list[str],
+        ] = {}
+
+        for slot_id in group_slots:
+            rows: list[str] = []
+
+            for raw_answer in (
+                answer_by_slot.get(
+                    slot_id,
+                    {},
+                )
+                or {}
+            ).values():
+                if isinstance(
+                    raw_answer,
+                    dict,
+                ):
+                    text_value = str(
+                        raw_answer.get(
+                            "text",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+                else:
+                    text_value = str(
+                        raw_answer
+                        or ""
+                    ).strip()
+
+                if text_value:
+                    rows.append(
+                        text_value
+                    )
+
+            answer_texts_by_slot[
+                slot_id
+            ] = rows
+
+        for target_slot in group_slots:
+            current = list(
+                distractor_candidates_by_slot.get(
+                    target_slot,
+                    [],
+                )
+                or []
+            )
+
+            seen: set[str] = set()
+
+            for value in current:
+                raw_norm = (
+                    normalize_fn(
+                        value
+                    )
+                    if callable(
+                        normalize_fn
+                    )
+                    else str(
+                        value
+                    ).casefold().strip()
+                )
+
+                if raw_norm:
+                    seen.add(
+                        raw_norm
+                    )
+
+            added: list[str] = []
+
+            for sibling_slot in group_slots:
+                if (
+                    sibling_slot
+                    == target_slot
+                ):
+                    continue
+
+                for candidate in (
+                    answer_texts_by_slot.get(
+                        sibling_slot,
+                        [],
+                    )
+                ):
+                    norm = (
+                        normalize_fn(
+                            candidate
+                        )
+                        if callable(
+                            normalize_fn
+                        )
+                        else candidate.casefold().strip()
+                    )
+
+                    if (
+                        not norm
+                        or norm in seen
+                    ):
+                        continue
+
+                    seen.add(
+                        norm
+                    )
+                    current.append(
+                        candidate
+                    )
+                    added.append(
+                        candidate
+                    )
+
+                    if len(
+                        current
+                    ) >= 32:
+                        break
+
+                if len(
+                    current
+                ) >= 32:
+                    break
+
+            distractor_candidates_by_slot[
+                target_slot
+            ] = current
+
+            print(
+                "[QUIZ PEDAGOGY] "
+                "DAQ-V1.8 sibling-distractors "
+                f"group={group_key} "
+                f"slot={target_slot} "
+                f"siblings={len(group_slots) - 1} "
+                f"added={len(added)} "
+                f"total={len(current)}"
+            )
+
+
+def _daq_extract_atomic_date_values(
+    text_value: str,
+) -> list[str]:
+    """
+    DAQ-V1.10:
+    extract source-grounded atomic DATE answers from one
+    evidence unit without inventing any outside fact.
+    """
+    text = str(
+        text_value
+        or ""
+    )
+
+    values: list[str] = []
+    seen: set[str] = set()
+
+    # Full slash/dash dates first.
+    for match in re.finditer(
+        r"(?<!\d)"
+        r"\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4})"
+        r"(?!\d)",
+        text,
+    ):
+        value = match.group(0).strip()
+
+        norm = _normalize_compare_text(
+            value
+        )
+
+        if (
+            norm
+            and norm not in seen
+        ):
+            seen.add(
+                norm
+            )
+            values.append(
+                value
+            )
+
+    # Then four-digit years.
+    for match in re.finditer(
+        r"(?<!\d)"
+        r"(?:1\d{3}|20\d{2})"
+        r"(?!\d)",
+        text,
+    ):
+        value = match.group(0)
+
+        norm = _normalize_compare_text(
+            value
+        )
+
+        if (
+            norm
+            and norm not in seen
+        ):
+            seen.add(
+                norm
+            )
+            values.append(
+                value
+            )
+
+    return values
+
+
+def _daq_enrich_atomic_date_answers(
+    *,
+    slot_specs: list[dict],
+    evidence_by_slot: dict[
+        str,
+        dict[str, str],
+    ],
+    answer_by_slot: dict[
+        str,
+        dict[str, dict],
+    ],
+) -> None:
+    """
+    DAQ-V1.10 — source-grounded atomic DATE enrichment.
+
+    Important:
+    - only values literally present in evidence are added;
+    - every derived answer keeps the SAME local evidence_id;
+    - no answer/evidence is copied across slots;
+    - non-HISTORY/DATE values are ignored by the existing
+      domain/type classifier.
+    """
+
+    source_by_slot = {
+        str(
+            spec.get(
+                "id",
+                "",
+            )
+        ): str(
+            spec.get(
+                "source_text",
+                "",
+            )
+            or ""
+        )
+        for spec in slot_specs
+    }
+
+    for (
+        raw_slot_id,
+        evidence_bucket,
+    ) in evidence_by_slot.items():
+        slot_id = str(
+            raw_slot_id
+        )
+
+        answers = answer_by_slot.setdefault(
+            slot_id,
+            {},
+        )
+
+        existing_norms = {
+            _normalize_compare_text(
+                str(
+                    spec.get(
+                        "text",
+                        "",
+                    )
+                    if isinstance(
+                        spec,
+                        dict,
+                    )
+                    else spec
+                )
+            )
+            for spec in answers.values()
+        }
+
+        existing_norms.discard(
+            ""
+        )
+
+        source_text = source_by_slot.get(
+            slot_id,
+            "",
+        )
+
+        added: list[
+            tuple[
+                str,
+                str,
+                str,
+            ]
+        ] = []
+
+        next_index = 0
+
+        for (
+            raw_evidence_id,
+            raw_evidence,
+        ) in (
+            evidence_bucket
+            or {}
+        ).items():
+            evidence_id = str(
+                raw_evidence_id
+            ).strip().upper()
+
+            if isinstance(
+                raw_evidence,
+                dict,
+            ):
+                evidence_text = str(
+                    raw_evidence.get(
+                        "text",
+                        raw_evidence.get(
+                            "content",
+                            raw_evidence.get(
+                                "quote",
+                                "",
+                            ),
+                        ),
+                    )
+                    or ""
+                ).strip()
+            else:
+                evidence_text = str(
+                    raw_evidence
+                    or ""
+                ).strip()
+
+            if (
+                not evidence_id
+                or not evidence_text
+            ):
+                continue
+
+            for value in (
+                _daq_extract_atomic_date_values(
+                    evidence_text
+                )
+            ):
+                norm = (
+                    _normalize_compare_text(
+                        value
+                    )
+                )
+
+                if (
+                    not norm
+                    or norm in existing_norms
+                ):
+                    continue
+
+                profile = (
+                    infer_knowledge_profile(
+                        answer_text=value,
+                        evidence_text=(
+                            evidence_text
+                        ),
+                        source_text=(
+                            source_text
+                        ),
+                    )
+                )
+
+                if (
+                    profile.domain
+                    != "HISTORY"
+                    or profile.knowledge_type
+                    != "DATE"
+                ):
+                    continue
+
+                while True:
+                    answer_id = (
+                        f"AD{next_index}"
+                    )
+
+                    next_index += 1
+
+                    if (
+                        answer_id
+                        not in answers
+                    ):
+                        break
+
+                answers[
+                    answer_id
+                ] = {
+                    "text": value,
+                    "evidence_id": (
+                        evidence_id
+                    ),
+                }
+
+                existing_norms.add(
+                    norm
+                )
+
+                added.append(
+                    (
+                        answer_id,
+                        evidence_id,
+                        value,
+                    )
+                )
+
+                # Bound enrichment for one micro-context.
+                if len(
+                    added
+                ) >= 8:
+                    break
+
+            if len(
+                added
+            ) >= 8:
+                break
+
+        if added:
+            print(
+                "[QUIZ PEDAGOGY] "
+                "DAQ-V1.10 atomic-dates "
+                f"slot={slot_id} "
+                f"added={len(added)} "
+                f"values={added!r}"
+            )
+
+
+def _daq_log_catalog_diagnostics(
+    *,
+    slot_specs: list[dict],
+    sources: dict,
+    slots: list[dict],
+    evidence_by_slot: dict,
+    answer_by_slot: dict,
+) -> None:
+    """
+    DAQ-V1.7 diagnostic only.
+
+    Prints the real compact-catalog shape before answer preflight.
+    It does not modify source text, answers, evidence, or AI prompts.
+    """
+    import hashlib
+
+    spec_by_slot = {
+        str(spec.get("id")): spec
+        for spec in slot_specs
+    }
+
+    for slot in slots:
+        slot_id = str(
+            slot.get(
+                "slot",
+                "",
+            )
+        )
+
+        source_ref = str(
+            slot.get(
+                "source_ref",
+                "",
+            )
+            or ""
+        )
+
+        spec = (
+            spec_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        source_text = str(
+            sources.get(
+                source_ref,
+                "",
+            )
+            or ""
+        )
+
+        source_digest = (
+            hashlib.sha1(
+                source_text.encode(
+                    "utf-8",
+                    errors="ignore",
+                )
+            )
+            .hexdigest()[:10]
+        )
+
+        source_hint = None
+
+        for key in (
+            "source_chunk_id",
+            "chunk_id",
+            "document_chunk_id",
+            "source_id",
+            "chunk_index",
+        ):
+            value = spec.get(key)
+
+            if value is not None:
+                source_hint = (
+                    f"{key}={value}"
+                )
+                break
+
+        if source_hint is None:
+            source_hint = "unknown"
+
+        evidence_bucket = (
+            evidence_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        answer_bucket = (
+            answer_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        answer_rows: list[str] = []
+
+        for (
+            answer_id,
+            raw_answer,
+        ) in answer_bucket.items():
+            if isinstance(
+                raw_answer,
+                dict,
+            ):
+                answer_text = str(
+                    raw_answer.get(
+                        "text",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                evidence_id = str(
+                    raw_answer.get(
+                        "evidence_id",
+                        "",
+                    )
+                    or ""
+                ).strip()
+            else:
+                answer_text = str(
+                    raw_answer
+                    or ""
+                ).strip()
+                evidence_id = ""
+
+            if len(answer_text) > 70:
+                answer_text = (
+                    answer_text[:67]
+                    + "..."
+                )
+
+            answer_rows.append(
+                f"{answer_id}"
+                f"->{evidence_id}:"
+                f"{answer_text}"
+            )
+
+        source_preview = (
+            " ".join(
+                source_text.split()
+            )[:100]
+        )
+
+        print(
+            "[QUIZ PEDAGOGY] "
+            "DAQ-V1.7 catalog "
+            f"slot={slot_id} "
+            f"source_ref={source_ref!r} "
+            f"source_hint={source_hint} "
+            f"source_hash={source_digest} "
+            f"source_chars={len(source_text)} "
+            f"evidence={len(evidence_bucket)} "
+            f"answers={len(answer_bucket)} "
+            f"spec_keys={sorted(str(k) for k in spec.keys())!r} "
+            f"answer_rows={answer_rows!r} "
+            f"preview={source_preview!r}"
+        )
+
+
+
+def _daq_evidence_text(
+    evidence_bucket: dict,
+    evidence_id: str,
+    *,
+    answer_spec: dict | None = None,
+) -> str:
+    answer_spec = answer_spec or {}
+
+    embedded = str(
+        answer_spec.get(
+            "evidence_text",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if embedded:
+        return embedded
+
+    raw = (
+        evidence_bucket.get(
+            evidence_id
+        )
+        if isinstance(
+            evidence_bucket,
+            dict,
+        )
+        else None
+    )
+
+    if isinstance(
+        raw,
+        dict,
+    ):
+        for key in (
+            "text",
+            "evidence_text",
+            "quote",
+            "source_text",
+        ):
+            value = str(
+                raw.get(
+                    key,
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if value:
+                return value
+
+        return ""
+
+    return str(
+        raw
+        or ""
+    ).strip()
+
+
+def _daq_viable_distractor_pool(
+    *,
+    correct_text: str,
+    evidence_text: str,
+    source_text: str,
+    profile,
+    global_answer_rows: list[dict],
+    fallback_candidates: list[str],
+) -> list[str]:
+    pool: list[str] = []
+
+    # DAQ-V1.5 typed local-label isolation:
+    # raw "Label: definition" extraction has no per-label
+    # evidence object. It is safe as a TERM pool, but must
+    # not be promoted into PERSON/PLACE/EVENT/PROCESS merely
+    # because another sentence in the same chunk has that cue.
+    if profile.knowledge_type == "TERM":
+        for candidate in (
+            _extract_local_label_candidates(
+                source_text,
+                correct_text=correct_text,
+            )
+        ):
+            if candidate_compatible_with_profile(
+                candidate,
+                correct_profile=profile,
+                candidate_context=source_text,
+            ):
+                pool.append(
+                    candidate
+                )
+
+    for row in global_answer_rows:
+        candidate = str(
+            row.get(
+                "answer_text",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if (
+            not candidate
+            or _normalize_compare_text(
+                candidate
+            )
+            == _normalize_compare_text(
+                correct_text
+            )
+        ):
+            continue
+
+        if candidate_compatible_with_profile(
+            candidate,
+            correct_profile=profile,
+            candidate_context=str(
+                row.get(
+                    "evidence_text",
+                    "",
+                )
+                or source_text
+            ),
+        ):
+            pool.append(
+                candidate
+            )
+
+    pool.extend(
+        structured_distractor_variants(
+            correct_text,
+            profile=profile,
+        )
+    )
+
+    for candidate in (
+        fallback_candidates
+        or []
+    ):
+        candidate_text = str(
+            candidate
+            or ""
+        ).strip()
+
+        if (
+            candidate_text
+            and candidate_compatible_with_profile(
+                candidate_text,
+                correct_profile=profile,
+                candidate_context=source_text,
+            )
+        ):
+            pool.append(
+                candidate_text
+            )
+
+    if profile.knowledge_type in {
+        "TERM",
+        "EVENT",
+        "PROCESS",
+    }:
+        pool = rank_domain_candidates(
+            pool,
+            correct_text=correct_text,
+            correct_profile=profile,
+            candidate_context=source_text,
+        )
+
+    merged: list[str] = []
+    seen = {
+        _normalize_compare_text(
+            correct_text
+        )
+    }
+
+    for candidate in pool:
+        text = str(
+            candidate
+            or ""
+        ).strip()
+
+        norm = (
+            _normalize_compare_text(
+                text
+            )
+        )
+
+        if (
+            not text
+            or not norm
+            or norm in seen
+        ):
+            continue
+
+        seen.add(
+            norm
+        )
+        merged.append(
+            text
+        )
+
+    return merged
+
+
+def _daq_rebalance_fixed_choices_for_viability(
+    *,
+    slot_specs: list[dict],
+    slots: list[dict],
+    evidence_by_slot: dict,
+    answer_by_slot: dict,
+    distractor_candidates_by_slot: dict,
+    fixed_choice_by_slot: dict,
+) -> dict:
+    """
+    Prefer backend-owned correct answers that can actually
+    support three safe distractors BEFORE an AI call.
+
+    This is especially important when one short source chunk
+    is reused for several requested quiz slots.
+    """
+    source_by_slot = {
+        str(
+            spec.get(
+                "id"
+            )
+        ): str(
+            spec.get(
+                "source_text",
+                "",
+            )
+            or ""
+        )
+        for spec in slot_specs
+    }
+
+    global_answer_rows: list[dict] = []
+
+    for (
+        raw_slot_id,
+        answer_bucket,
+    ) in (
+        answer_by_slot.items()
+    ):
+        slot_id = str(
+            raw_slot_id
+        )
+
+        evidence_bucket = (
+            evidence_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        for (
+            raw_answer_id,
+            raw_spec,
+        ) in (
+            (
+                answer_bucket
+                or {}
+            ).items()
+        ):
+            spec = (
+                raw_spec
+                if isinstance(
+                    raw_spec,
+                    dict,
+                )
+                else {
+                    "text": raw_spec,
+                }
+            )
+
+            answer_text = str(
+                spec.get(
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            evidence_id = str(
+                spec.get(
+                    "evidence_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            evidence_text = (
+                _daq_evidence_text(
+                    evidence_bucket,
+                    evidence_id,
+                    answer_spec=spec,
+                )
+            )
+
+            if (
+                answer_text
+                and evidence_id
+                and evidence_text
+            ):
+                global_answer_rows.append(
+                    {
+                        "slot_id": (
+                            slot_id
+                        ),
+                        "answer_id": str(
+                            raw_answer_id
+                        ),
+                        "answer_text": (
+                            answer_text
+                        ),
+                        "evidence_id": (
+                            evidence_id
+                        ),
+                        "evidence_text": (
+                            evidence_text
+                        ),
+                    }
+                )
+
+    used_answers: set[str] = set()
+    rebalanced: dict = {}
+
+    for slot in slots:
+        slot_id = str(
+            slot.get(
+                "slot"
+            )
+        )
+
+        current = dict(
+            fixed_choice_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        source_text = (
+            source_by_slot.get(
+                slot_id,
+                "",
+            )
+        )
+
+        evidence_bucket = (
+            evidence_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        candidate_rows: list[dict] = []
+
+        current_text = str(
+            current.get(
+                "answer_text",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if current_text:
+            candidate_rows.append(
+                {
+                    "slot_id": slot_id,
+                    "answer_id": str(
+                        current.get(
+                            "answer_id",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "answer_text": (
+                        current_text
+                    ),
+                    "evidence_id": str(
+                        current.get(
+                            "evidence_id",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "evidence_text": str(
+                        current.get(
+                            "evidence_text",
+                            "",
+                        )
+                        or ""
+                    ),
+                    "is_current": True,
+                }
+            )
+
+        answer_bucket = (
+            answer_by_slot.get(
+                slot_id,
+                {},
+            )
+            or {}
+        )
+
+        for (
+            raw_answer_id,
+            raw_spec,
+        ) in answer_bucket.items():
+            spec = (
+                raw_spec
+                if isinstance(
+                    raw_spec,
+                    dict,
+                )
+                else {
+                    "text": raw_spec,
+                }
+            )
+
+            answer_text = str(
+                spec.get(
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            evidence_id = str(
+                spec.get(
+                    "evidence_id",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            evidence_text = (
+                _daq_evidence_text(
+                    evidence_bucket,
+                    evidence_id,
+                    answer_spec=spec,
+                )
+            )
+
+            if (
+                not answer_text
+                or not evidence_id
+                or not evidence_text
+            ):
+                continue
+
+            if any(
+                _normalize_compare_text(
+                    row.get(
+                        "answer_text",
+                        "",
+                    )
+                )
+                == _normalize_compare_text(
+                    answer_text
+                )
+                for row in candidate_rows
+            ):
+                continue
+
+            candidate_rows.append(
+                {
+                    "slot_id": slot_id,
+                    "answer_id": str(
+                        raw_answer_id
+                    ),
+                    "answer_text": (
+                        answer_text
+                    ),
+                    "evidence_id": (
+                        evidence_id
+                    ),
+                    "evidence_text": (
+                        evidence_text
+                    ),
+                    "is_current": False,
+                }
+            )
+
+        evaluated: list[
+            tuple[
+                tuple,
+                dict,
+                list[str],
+                object,
+            ]
+        ] = []
+
+        for row in candidate_rows:
+            answer_text = str(
+                row[
+                    "answer_text"
+                ]
+            )
+
+            evidence_text = str(
+                row[
+                    "evidence_text"
+                ]
+            )
+
+            profile = (
+                infer_knowledge_profile(
+                    answer_text=(
+                        answer_text
+                    ),
+                    evidence_text=(
+                        evidence_text
+                    ),
+                    source_text=(
+                        source_text
+                    ),
+                )
+            )
+
+            pool = (
+                _daq_viable_distractor_pool(
+                    correct_text=(
+                        answer_text
+                    ),
+                    evidence_text=(
+                        evidence_text
+                    ),
+                    source_text=(
+                        source_text
+                    ),
+                    profile=(
+                        profile
+                    ),
+                    global_answer_rows=(
+                        global_answer_rows
+                    ),
+                    fallback_candidates=list(
+                        distractor_candidates_by_slot.get(
+                            slot_id,
+                            [],
+                        )
+                        or []
+                    ),
+                )
+            )
+
+            # DAQ-V1.9 candidate-diagnostics:
+            # expose WHY a grounded candidate is or is not viable.
+            safe: list[str] = []
+            sanitize_error: str | None = None
+
+            try:
+                safe, _ = (
+                    _sanitize_v6_distractors(
+                        model_distractors=[],
+                        answer_text=(
+                            answer_text
+                        ),
+                        evidence_quote=(
+                            evidence_text
+                        ),
+                        slot_answers={
+                            str(
+                                row[
+                                    "answer_id"
+                                ]
+                            ): {
+                                "text": (
+                                    answer_text
+                                ),
+                            },
+                        },
+                        extra_candidates=(
+                            pool
+                        ),
+                    )
+                )
+
+                viable = (
+                    len(
+                        safe
+                    )
+                    == 3
+                )
+
+            except ValueError as exc:
+                viable = False
+                sanitize_error = str(
+                    exc
+                )
+
+            norm = (
+                _normalize_compare_text(
+                    answer_text
+                )
+            )
+
+            structured_count = len(
+                structured_distractor_variants(
+                    answer_text,
+                    profile=profile,
+                )
+            )
+
+            priority = (
+                0
+                if viable
+                else 1,
+                0
+                if norm
+                not in used_answers
+                else 1,
+                0
+                if bool(
+                    row.get(
+                        "is_current"
+                    )
+                )
+                else 1,
+                -structured_count,
+                -len(
+                    pool
+                ),
+                norm,
+            )
+
+            print(
+                "[QUIZ PEDAGOGY] "
+                "DAQ-V1.9 candidate "
+                f"slot={slot_id} "
+                f"answer={answer_text!r} "
+                f"domain={profile.domain} "
+                f"type={profile.knowledge_type} "
+                f"pool={len(pool)} "
+                f"safe={len(safe)} "
+                f"viable={viable} "
+                f"used={norm in used_answers} "
+                f"current={bool(row.get('is_current'))} "
+                f"safe_values={safe!r} "
+                f"error={sanitize_error!r}"
+            )
+
+            evaluated.append(
+                (
+                    priority,
+                    row,
+                    pool,
+                    profile,
+                )
+            )
+
+        evaluated.sort(
+            key=lambda item: item[0]
+        )
+
+        # DAQ-V1.6 hard unique correct-answer capacity.
+        chosen = None
+
+        for candidate in evaluated:
+            (
+                candidate_priority,
+                candidate_row,
+                _candidate_pool,
+                _candidate_profile,
+            ) = candidate
+
+            candidate_norm = (
+                _normalize_compare_text(
+                    candidate_row.get(
+                        "answer_text",
+                        "",
+                    )
+                )
+            )
+
+            if (
+                candidate_priority[0] == 0
+                and candidate_norm
+                and candidate_norm not in used_answers
+            ):
+                chosen = candidate
+                break
+
+        if chosen is None:
+            print(
+                "[QUIZ PEDAGOGY] "
+                "DAQ-V1.6 viability "
+                f"slot={slot_id} "
+                "NO_UNIQUE_VIABLE_ALTERNATIVE"
+            )
+
+            raise QuizPreflightCapacityError(
+                "DAQ-V1.6 preflight cannot produce the requested "
+                "number of unique questions from the selected source: "
+                f"slot={slot_id} has no unused answer with three "
+                "safe distractors"
+            )
+
+        (
+            _priority,
+            row,
+            pool,
+            profile,
+        ) = chosen
+
+        chosen_text = str(
+            row[
+                "answer_text"
+            ]
+        )
+
+        chosen_norm = (
+            _normalize_compare_text(
+                chosen_text
+            )
+        )
+
+        used_answers.add(
+            chosen_norm
+        )
+
+        new_choice = dict(
+            current
+        )
+
+        new_choice.update(
+            {
+                "answer_id": (
+                    row[
+                        "answer_id"
+                    ]
+                ),
+                "answer_text": (
+                    chosen_text
+                ),
+                "evidence_id": (
+                    row[
+                        "evidence_id"
+                    ]
+                ),
+                "evidence_text": (
+                    row[
+                        "evidence_text"
+                    ]
+                ),
+            }
+        )
+
+        rebalanced[
+            slot_id
+        ] = new_choice
+
+        old_text = (
+            current_text
+            or "(none)"
+        )
+
+        print(
+            "[QUIZ PEDAGOGY] "
+            "DAQ-V1.4 viability "
+            f"slot={slot_id} "
+            f"type={profile.knowledge_type} "
+            f"domain={profile.domain} "
+            f"pool={len(pool)} "
+            f"answer={old_text!r}"
+            "->"
+            f"{chosen_text!r}"
+        )
+
+    return rebalanced
+
+
 def _generate_compact_slot_questions(
     provider,
     *,
@@ -8410,6 +10790,28 @@ def _generate_compact_slot_questions(
         slot_specs
     )
 
+    _daq_enrich_atomic_date_answers(
+        slot_specs=slot_specs,
+        evidence_by_slot=evidence_by_slot,
+        answer_by_slot=answer_by_slot,
+    )
+
+    _daq_log_catalog_diagnostics(
+        slot_specs=slot_specs,
+        sources=sources,
+        slots=slots,
+        evidence_by_slot=evidence_by_slot,
+        answer_by_slot=answer_by_slot,
+    )
+
+    _daq_share_sibling_microcontext_distractors(
+        slot_specs=slot_specs,
+        answer_by_slot=answer_by_slot,
+        distractor_candidates_by_slot=(
+            distractor_candidates_by_slot
+        ),
+    )
+
     fixed_choice_by_slot = (
         _preselect_backend_choices(
             slots=(
@@ -8422,6 +10824,47 @@ def _generate_compact_slot_questions(
                 answer_by_slot
             ),
         )
+    )
+
+    fixed_choice_by_slot = (
+        _daq_rebalance_fixed_choices_for_viability(
+            slot_specs=(
+                slot_specs
+            ),
+            slots=(
+                slots
+            ),
+            evidence_by_slot=(
+                evidence_by_slot
+            ),
+            answer_by_slot=(
+                answer_by_slot
+            ),
+            distractor_candidates_by_slot=(
+                distractor_candidates_by_slot
+            ),
+            fixed_choice_by_slot=(
+                fixed_choice_by_slot
+            ),
+        )
+    )
+
+    (
+        answer_by_slot,
+        distractor_candidates_by_slot,
+    ) = _apply_semantic_distractor_catalog(
+        slot_specs=(
+            slot_specs
+        ),
+        fixed_choice_by_slot=(
+            fixed_choice_by_slot
+        ),
+        answer_by_slot=(
+            answer_by_slot
+        ),
+        distractor_candidates_by_slot=(
+            distractor_candidates_by_slot
+        ),
     )
 
     retry_context = (
@@ -8498,6 +10941,23 @@ RETRY_CONTEXT:
             ]
         )
 
+        knowledge_profile = (
+            infer_knowledge_profile(
+                answer_text=str(
+                    choice[
+                        "answer_text"
+                    ]
+                ),
+                evidence_text=str(
+                    choice.get(
+                        "evidence_text",
+                        "",
+                    )
+                    or ""
+                ),
+            )
+        )
+
         task_rows.append(
             {
                 "slot": (
@@ -8509,14 +10969,15 @@ RETRY_CONTEXT:
                     ]
                 ),
                 "answer_kind": (
-                    "FORMULA"
-                    if "="
-                    in str(
-                        choice[
-                            "answer_text"
-                        ]
+                    knowledge_profile.knowledge_type
+                ),
+                "domain": (
+                    knowledge_profile.domain
+                ),
+                "guidance": (
+                    question_guidance(
+                        knowledge_profile
                     )
-                    else "TERM"
                 ),
                 "language": (
                     _text_language_hint(
@@ -8533,93 +10994,90 @@ RETRY_CONTEXT:
             }
         )
 
-    example_slot = str(
-        task_rows[0]["slot"]
-    )
+    expected_slots = [
+        str(slot["slot"])
+        for slot in slots
+    ]
+    task_count = len(task_rows)
+
+    output_skeleton = {
+        "items": [
+            {
+                "slot": slot_id,
+                "q": "question",
+            }
+            for slot_id in expected_slots
+        ]
+    }
 
     prompt = f"""
-Create exactly ONE direct multiple-choice question
-for EVERY task below.
+Create exactly {task_count} study-question stem item(s).
+There is exactly ONE output item for EACH task.
 
 Difficulty: {difficulty}
 Use the same language as each task.
 
+TASK_COUNT: {task_count}
+REQUIRED_SLOTS:
+{json.dumps(expected_slots, ensure_ascii=False)}
+
 TASKS:
-{json.dumps(
-    task_rows,
-    ensure_ascii=False,
-)}
+{json.dumps(task_rows, ensure_ascii=False)}
 
 {retry_block}
 
-Return JSON ONLY:
+OUTPUT SHAPE FOR THIS REQUEST:
+{json.dumps(output_skeleton, ensure_ascii=False)}
 
-{{
-  "items": [
-    {{
-      "slot": "{example_slot}",
-      "q": "question",
-      "d": ["wrong 1","wrong 2","wrong 3"]
-    }}
-  ]
-}}
+STRICT OUTPUT CONTRACT:
+- response.items MUST contain exactly {task_count} item(s);
+- include every REQUIRED_SLOTS value exactly once;
+- preserve each slot exactly as supplied by backend;
+- do NOT stop after the first item;
+- return ONLY slot and q;
+- do NOT return d, distractors, options, evidence IDs,
+  answer IDs, correct keys, explanations, or Markdown.
 
-STRICT RULES:
-- return one item for every task;
-- copy each slot exactly from TASKS;
+QUESTION-STEM RULES:
 - q must be <= 20 words;
-- the supplied correct_answer is fixed by backend;
-- if language is VI, write q and d in Vietnamese;
-- if language is EN, write q and d in English;
-- write q so correct_answer answers q directly;
-- NEVER copy the full correct_answer into q;
-- if answer_kind is TERM, describe/identify the term from evidence;
-- never make a TERM question ask for a role/function unless
-  correct_answer itself expresses that role/function;
-- never use a context-dependent fragment such as
-  "khi đó", "do đó", "điều này" as a standalone answer;
-- if answer_kind is FORMULA, ask for the formula/expression;
-- when evidence shows one formula changing into another,
-  mention the transition/context in q instead of asking only
-  "Công thức X là gì?";
-- do not ask a plural/list question unless correct_answer
-  itself contains multiple elements;
-- d must contain exactly 3 short plausible wrong answers;
-- NEVER place correct_answer in d;
-- if answer_kind is FORMULA, every distractor must also be a formula;
-- if answer_kind is TERM, do not use formulas as distractors;
-- if evidence uses "correct_answer: definition", every
-  distractor must be a short standalone concept label/noun
-  phrase; never return sentence fragments such as "Là...",
-  "cộng với...", "Phần ... chính là...", "khi...", etc.;
-- distractors must not be directly supported by evidence;
-- ask only a direct FACT or DEFINITION question;
+- backend already owns the correct answer and all options;
+- write q so the backend-owned correct answer answers q directly;
+- NEVER copy the full correct answer into q;
+- avoid wording that gives away the answer by repeating most
+  of its meaningful words;
+- use the same language as the task;
+- FOLLOW each task's guidance field and answer_kind;
+- TERM: ask a natural definition/identification question;
+- PERSON: ask WHO and include role/event context;
+- DATE: ask WHEN/WHICH YEAR and name the event;
+- PLACE: ask WHERE/WHICH PLACE from an explicit geographic fact;
+- EVENT: ask WHICH EVENT using a direct identifying fact;
+- PROCESS: ask WHICH PROCESS/MECHANISM from explicit evidence;
+- NUMERIC: ask for the VALUE and preserve quantity/unit context;
+- FORMULA: ask for the formula/expression with explicit context;
+- CHEMICAL_FORMULA: ask only when substance->formula mapping is explicit;
+- CHEMICAL_EQUATION: ask only when the full reaction is explicit;
+- never use context-poor wording such as "sau khi thay đổi",
+  "điều này", "nó", or "khi đó" without naming the subject;
+- do not ask plural/list questions unless the supplied answer
+  contains multiple elements;
+- ask only a direct FACT, DEFINITION, or FORMULA question;
 - do not ask why, cause, effect, purpose, requirement,
   inference, or multi-step reasoning;
-- if a natural direct question would reveal correct_answer,
-  write a source-grounded fill-in-the-blank question instead;
-- return only slot/q/d, no evidence IDs, answer IDs,
-  correct key, explanation, Markdown, or extra fields.
+- if a direct question would reveal the answer, write a
+  source-grounded fill-in-the-blank stem instead.
 """.strip()
 
     max_output_tokens = min(
-        900,
-        max(
-            300,
-            120
-            + (
-                len(
-                    slot_specs
-                )
-                * 130
-            ),
+        500,
+        100
+        + 70
+        * len(
+            task_rows
         ),
     )
 
-    started = (
-        time.perf_counter()
-    )
-
+    started = perf_counter()
     result = provider.chat(
         [
             {
@@ -11157,25 +13615,52 @@ def _looks_like_toc(
 def _get_quiz_candidate_chunks(
     chunks: list[DocumentChunk],
 ) -> list[DocumentChunk]:
+    scored: list[tuple[float, DocumentChunk]] = []
+    rejected = 0
+
+    for chunk in chunks:
+        content = str(chunk.content or "").strip()
+        if len(content) < 200:
+            rejected += 1
+            continue
+
+        issue = qsp_chunk_issue(content)
+        if issue:
+            rejected += 1
+            continue
+
+        scored.append((qsp_score(content), chunk))
+
+    if not scored:
+        fallback = [
+            chunk
+            for chunk in chunks
+            if len((chunk.content or "").strip()) >= 200
+            and not _looks_like_toc(chunk.content or "")
+        ]
+        print(
+            "[QUIZ PEDAGOGY] "
+            f"{QSP_VERSION} no scored candidates; "
+            f"fallback={len(fallback)}"
+        )
+        return fallback
+
+    accepted_ids = {int(chunk.id) for _, chunk in scored}
     candidates = [
         chunk
         for chunk in chunks
-        if (
-            len((chunk.content or "").strip()) >= 500
-            and not _looks_like_toc(chunk.content or "")
-        )
+        if int(chunk.id) in accepted_ids
     ]
 
-    if not candidates:
-        candidates = [
-            chunk for chunk in chunks if len((chunk.content or "").strip()) >= 200
-        ]
-
-    if not candidates:
-        candidates = chunks
-
+    scores = [score for score, _ in scored]
+    print(
+        "[QUIZ PEDAGOGY] "
+        f"{QSP_VERSION} accepted={len(candidates)} "
+        f"rejected={rejected} "
+        f"score_max={max(scores):.2f} "
+        f"score_min={min(scores):.2f}"
+    )
     return candidates
-
 
 def _select_source_chunks(
     chunks: list[DocumentChunk],
@@ -11185,47 +13670,68 @@ def _select_source_chunks(
     if not chunks:
         return []
 
-    source_count = min(
-        len(chunks),
-        question_count,
-        max_sources,
-    )
+    source_count = min(len(chunks), question_count, max_sources)
 
     if source_count <= 1:
-        return [chunks[0]]
+        return [
+            max(
+                chunks,
+                key=lambda chunk: (
+                    qsp_score(chunk.content or ""),
+                    -int(chunk.chunk_index or 0),
+                ),
+            )
+        ]
 
-    last_index = len(chunks) - 1
-
-    indexes = [
-        round(index * last_index / (source_count - 1)) for index in range(source_count)
-    ]
-
+    n = len(chunks)
     selected: list[DocumentChunk] = []
-
     seen_ids: set[int] = set()
 
-    for index in indexes:
-        chunk = chunks[index]
+    for bucket_index in range(source_count):
+        start = bucket_index * n // source_count
+        end = (bucket_index + 1) * n // source_count
+        bucket = chunks[start:max(start + 1, end)]
 
-        if chunk.id not in seen_ids:
-            selected.append(chunk)
-            seen_ids.add(chunk.id)
+        chosen = max(
+            bucket,
+            key=lambda chunk: (
+                qsp_score(chunk.content or ""),
+                -int(chunk.chunk_index or 0),
+            ),
+        )
+
+        chunk_id = int(chosen.id)
+        if chunk_id not in seen_ids:
+            selected.append(chosen)
+            seen_ids.add(chunk_id)
 
     if len(selected) < source_count:
-        for chunk in chunks:
-
-            if chunk.id in seen_ids:
-                continue
-
+        remaining = sorted(
+            (
+                chunk
+                for chunk in chunks
+                if int(chunk.id) not in seen_ids
+            ),
+            key=lambda chunk: (
+                -qsp_score(chunk.content or ""),
+                int(chunk.chunk_index or 0),
+            ),
+        )
+        for chunk in remaining:
             selected.append(chunk)
-
-            seen_ids.add(chunk.id)
-
+            seen_ids.add(int(chunk.id))
             if len(selected) >= source_count:
                 break
 
+    print(
+        "[QUIZ PEDAGOGY] "
+        f"{QSP_VERSION} selected="
+        + ",".join(
+            f"{int(chunk.id)}:{qsp_score(chunk.content or ''):.1f}"
+            for chunk in selected
+        )
+    )
     return selected
-
 
 def _allocate_question_counts(
     chunks: list[DocumentChunk],
@@ -11270,6 +13776,180 @@ def _allocate_question_counts(
 # =========================================================
 # AI QUIZ GENERATION
 # =========================================================
+
+
+
+# =========================================================
+# FAST GROUNDING DIAGNOSTIC — FGD-V1
+#
+# Logging only. This wrapper MUST preserve the exact return
+# value from the existing _fast_grounding_check.
+# =========================================================
+
+FAST_GROUNDING_DIAGNOSTIC_VERSION = "FGD-V1"
+
+_fast_grounding_check_fgd_v1_base = (
+    _fast_grounding_check
+)
+
+
+def _fast_grounding_check(
+    *args,
+    **kwargs,
+):
+    result = (
+        _fast_grounding_check_fgd_v1_base(
+            *args,
+            **kwargs,
+        )
+    )
+
+    try:
+        ok = bool(result[0])
+        reason = str(result[1] or "")
+        verification = (
+            result[2]
+            if (
+                len(result) >= 3
+                and isinstance(result[2], dict)
+            )
+            else {}
+        )
+
+        if not ok:
+            question = kwargs.get("question")
+            evidence_quote = str(
+                kwargs.get("evidence_quote", "")
+                or ""
+            )
+            source_text = str(
+                kwargs.get("source_text", "")
+                or ""
+            )
+
+            question_text = str(
+                getattr(
+                    question,
+                    "question_text",
+                    "",
+                )
+                or ""
+            )
+
+            options = list(
+                getattr(
+                    question,
+                    "options",
+                    [],
+                )
+                or []
+            )
+
+            correct_options = [
+                str(
+                    getattr(
+                        option,
+                        "option_text",
+                        "",
+                    )
+                    or ""
+                ).strip()
+                for option in options
+                if bool(
+                    getattr(
+                        option,
+                        "is_correct",
+                        False,
+                    )
+                )
+            ]
+
+            distractors = [
+                str(
+                    getattr(
+                        option,
+                        "option_text",
+                        "",
+                    )
+                    or ""
+                ).strip()
+                for option in options
+                if not bool(
+                    getattr(
+                        option,
+                        "is_correct",
+                        False,
+                    )
+                )
+            ]
+
+            try:
+                relation = _detect_question_relation(
+                    question_text
+                )
+            except Exception:
+                relation = "UNKNOWN"
+
+            compact_verification = {
+                str(key): value
+                for key, value in verification.items()
+                if str(key) in {
+                    "relation",
+                    "relation_type",
+                    "correct_supported",
+                    "correct_option_supported",
+                    "supported_options",
+                    "supported_option_keys",
+                    "ambiguous",
+                    "evidence_supported",
+                    "question_supported",
+                    "failure_reason",
+                    "mode",
+                    "verification_mode",
+                }
+            }
+
+            print(
+                "[QUIZ GROUNDING DIAG] "
+                f"{FAST_GROUNDING_DIAGNOSTIC_VERSION} "
+                f"reason={reason!r} "
+                f"relation={relation!r}"
+            )
+            print(
+                "[QUIZ GROUNDING DIAG] "
+                f"question={question_text[:260]!r}"
+            )
+            print(
+                "[QUIZ GROUNDING DIAG] "
+                f"correct={correct_options!r}"
+            )
+            print(
+                "[QUIZ GROUNDING DIAG] "
+                f"distractors={distractors!r}"
+            )
+            print(
+                "[QUIZ GROUNDING DIAG] "
+                f"evidence={evidence_quote[:360]!r}"
+            )
+            print(
+                "[QUIZ GROUNDING DIAG] "
+                f"source_preview={source_text[:360]!r}"
+            )
+
+            if compact_verification:
+                print(
+                    "[QUIZ GROUNDING DIAG] "
+                    f"verification={compact_verification!r}"
+                )
+
+    except Exception as diagnostic_exc:
+        print(
+            "[QUIZ GROUNDING DIAG] "
+            "FGD-V1 logging failure ignored: "
+            f"{diagnostic_exc}"
+        )
+
+    return result
 
 
 def generate_quiz(
@@ -11750,6 +14430,7 @@ def generate_quiz(
     # slots individually.
     combined_initial_max_retries = 0
     combined_generation_ai_calls = 0
+    initial_batch_recovery_calls = 0
     initial_single_recovery_calls = 0
 
     try:
@@ -11839,6 +14520,69 @@ def generate_quiz(
             f"returned={len(raw_by_slot)} "
             f"missing={len(missing_initial_specs)}"
         )
+
+    # CG-V2: recover multiple missing slots in ONE additional
+    # model call before falling back to expensive serial recovery.
+    if len(missing_initial_specs) >= 2:
+        try:
+            (
+                batch_recovery_raw,
+                batch_recovery_model,
+                batch_recovery_ms,
+            ) = _generate_compact_slot_questions(
+                provider,
+                slot_specs=missing_initial_specs,
+                difficulty=payload.difficulty,
+                allow_partial_response=True,
+            )
+
+            combined_generation_ai_calls += 1
+            initial_batch_recovery_calls += 1
+            perf_initial_generation_ms += batch_recovery_ms
+
+            raw_by_slot.update(
+                batch_recovery_raw
+            )
+
+            ai_model_name = (
+                batch_recovery_model
+                or ai_model_name
+            )
+
+            _perf_log(
+                "quiz_initial_batch_recovery",
+                batch_recovery_ms,
+                extra=(
+                    f"requested_slots={len(missing_initial_specs)} "
+                    f"returned_slots={len(batch_recovery_raw)}"
+                ),
+            )
+
+        except AIProviderError as exc:
+            print(
+                "[QUIZ JSON] "
+                "initial batch recovery provider failure; "
+                "falling back to residual single-slot recovery: "
+                f"{exc}"
+            )
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            print(
+                "[QUIZ JSON] "
+                "initial batch recovery invalid JSON/schema; "
+                "falling back to residual single-slot recovery: "
+                f"{exc}"
+            )
+
+        missing_initial_specs = [
+            spec
+            for spec in missing_initial_specs
+            if str(spec["id"]) not in raw_by_slot
+        ]
 
     for missing_spec in missing_initial_specs:
         missing_slot_id = str(
@@ -12272,6 +15016,47 @@ def generate_quiz(
                 ]
             )
 
+            retry_previous_distractors = [
+                str(
+                    option.option_text
+                    or ""
+                ).strip()
+                for option
+                in item[
+                    "question"
+                ].options
+                if (
+                    not option.is_correct
+                    and str(
+                        option.option_text
+                        or ""
+                    ).strip()
+                )
+            ]
+
+            retry_section_id = (
+                int(
+                    item[
+                        "source_chunk"
+                    ].section_id
+                )
+                if item[
+                    "source_chunk"
+                ].section_id
+                is not None
+                else -1
+            )
+
+            retry_pool = (
+                retry_previous_distractors
+                + list(
+                    section_distractor_pool.get(
+                        retry_section_id,
+                        [],
+                    )
+                )
+            )
+
             retry_specs.append(
                 {
                     "id": (
@@ -12287,7 +15072,18 @@ def generate_quiz(
                             "source_text"
                         ]
                     ),
+                    "extra_distractor_candidates": (
+                        retry_pool
+                    ),
                 }
+            )
+
+            print(
+                "[QUIZ PEDAGOGY] "
+                "RDP-V1 fast-retry "
+                f"slot={item_id} "
+                f"preserved={len(retry_previous_distractors)} "
+                f"pool={len(retry_pool)}"
             )
 
             retry_context[
@@ -12579,6 +15375,47 @@ def generate_quiz(
 
             continue
 
+        single_previous_distractors = [
+            str(
+                option.option_text
+                or ""
+            ).strip()
+            for option
+            in missing_item[
+                "question"
+            ].options
+            if (
+                not option.is_correct
+                and str(
+                    option.option_text
+                    or ""
+                ).strip()
+            )
+        ]
+
+        single_section_id = (
+            int(
+                missing_item[
+                    "source_chunk"
+                ].section_id
+            )
+            if missing_item[
+                "source_chunk"
+            ].section_id
+            is not None
+            else -1
+        )
+
+        single_pool = (
+            single_previous_distractors
+            + list(
+                section_distractor_pool.get(
+                    single_section_id,
+                    [],
+                )
+            )
+        )
+
         single_spec = {
             "id": (
                 item_id
@@ -12593,7 +15430,18 @@ def generate_quiz(
                     "source_text"
                 ]
             ),
+            "extra_distractor_candidates": (
+                single_pool
+            ),
         }
+
+        print(
+            "[QUIZ PEDAGOGY] "
+            "RDP-V1 single-recovery "
+            f"slot={item_id} "
+            f"preserved={len(single_previous_distractors)} "
+            f"pool={len(single_pool)}"
+        )
 
         single_context = {
             item_id: {
@@ -13189,6 +16037,468 @@ def generate_quiz(
             }
         )
 
+    # =====================================================
+    # 9B. SRP-V1 — SOURCE / SLOT REPLACEMENT POOL
+    # =====================================================
+    #
+    # A deterministic pedagogical failure should not force
+    # the backend to keep regenerating from the same weak
+    # source/candidate. Prefer a different QSP-ranked chunk.
+    #
+    # This path is deliberately bounded:
+    # - max N alternate sources per failed slot;
+    # - max M replacement AI calls for the whole quiz.
+    #
+    # Fast grounding is sufficient for acceptance, exactly
+    # like the normal fast path above. Existing semantic,
+    # ownership and persistence validation remain intact.
+    slot_replacement_attempts = 0
+    slot_replacement_passed = 0
+    slot_replacement_failed = 0
+    slot_replacement_source_switches: list[str] = []
+
+    if (
+        failed_items
+        and SEMANTIC_POST_FALLBACK_MAX_RETRIES <= 0
+    ):
+        accepted_texts_for_replacement = {
+            _normalize_compare_text(
+                question.question_text
+            )
+            for question
+            in accepted_by_id.values()
+        }
+
+        selected_source_ids = {
+            int(chunk.id)
+            for chunk
+            in selected_chunks
+        }
+
+        # Prefer unused QSP-ranked chunks first. If the unused
+        # pool is too small, selected chunks other than the
+        # failed source are allowed as a bounded fallback.
+        ranked_replacement_chunks = sorted(
+            candidate_chunks,
+            key=lambda chunk: (
+                int(
+                    int(chunk.id)
+                    in selected_source_ids
+                ),
+                -qsp_score(
+                    chunk.content
+                    or ""
+                ),
+                int(
+                    chunk.chunk_index
+                    or 0
+                ),
+            ),
+        )
+
+        replacement_used_chunk_ids: set[int] = set()
+        remaining_failed_items: list[dict] = []
+
+        for failed_item in failed_items:
+            item_id = str(
+                failed_item[
+                    "id"
+                ]
+            )
+
+            original_chunk = (
+                failed_item[
+                    "source_chunk"
+                ]
+            )
+            original_chunk_id = int(
+                original_chunk.id
+            )
+
+            previous_question = ""
+            previous_question_obj = (
+                failed_item.get(
+                    "question"
+                )
+            )
+            if isinstance(
+                previous_question_obj,
+                QuestionCreate,
+            ):
+                previous_question = str(
+                    previous_question_obj.question_text
+                    or ""
+                ).strip()
+
+            pool = [
+                chunk
+                for chunk
+                in ranked_replacement_chunks
+                if int(
+                    chunk.id
+                )
+                != original_chunk_id
+                and int(
+                    chunk.id
+                )
+                not in replacement_used_chunk_ids
+            ]
+
+            if not pool:
+                pool = [
+                    chunk
+                    for chunk
+                    in ranked_replacement_chunks
+                    if int(
+                        chunk.id
+                    )
+                    != original_chunk_id
+                ]
+
+            replacement_success = False
+            last_replacement_reason = str(
+                failed_item.get(
+                    "failure_reason",
+                    "",
+                )
+                or ""
+            )
+
+            for replacement_chunk in pool[
+                :SLOT_REPLACEMENT_MAX_ATTEMPTS_PER_SLOT
+            ]:
+                if (
+                    slot_replacement_attempts
+                    >= SLOT_REPLACEMENT_MAX_TOTAL_AI_CALLS
+                ):
+                    break
+
+                replacement_source_text = str(
+                    replacement_chunk.content
+                    or ""
+                )[:1600].strip()
+
+                if not replacement_source_text:
+                    continue
+
+                replacement_spec = {
+                    "id": item_id,
+                    "source_chunk": replacement_chunk,
+                    "source_text": replacement_source_text,
+                    "extra_distractor_candidates": (
+                        section_distractor_pool.get(
+                            int(
+                                replacement_chunk.section_id
+                            )
+                            if replacement_chunk.section_id
+                            is not None
+                            else -1,
+                            [],
+                        )
+                    ),
+                }
+
+                try:
+                    (
+                        replacement_specs,
+                        _replacement_micro_metrics,
+                    ) = _apply_micro_contexts_to_slots(
+                        [
+                            replacement_spec
+                        ]
+                    )
+
+                    if not replacement_specs:
+                        last_replacement_reason = (
+                            "SRP micro-context selector "
+                            "returned no replacement spec"
+                        )
+                        continue
+
+                    replacement_spec = (
+                        replacement_specs[
+                            0
+                        ]
+                    )
+
+                    replacement_context = {
+                        item_id: {
+                            "previous_question": (
+                                previous_question
+                            ),
+                            "failure": (
+                                "Switch source because the "
+                                "previous slot failed quality "
+                                "validation. Previous reason: "
+                                + last_replacement_reason
+                            ),
+                        }
+                    }
+
+                    (
+                        replacement_raw_by_slot,
+                        replacement_model,
+                        replacement_call_ms,
+                    ) = _generate_compact_slot_questions(
+                        provider,
+                        slot_specs=[
+                            replacement_spec
+                        ],
+                        difficulty=(
+                            payload.difficulty
+                        ),
+                        retry_context=(
+                            replacement_context
+                        ),
+                        allow_partial_response=False,
+                    )
+
+                    slot_replacement_attempts += 1
+                    perf_retry_ms += (
+                        replacement_call_ms
+                    )
+
+                    ai_model_name = (
+                        replacement_model
+                        or ai_model_name
+                    )
+
+                    replacement_raw = (
+                        replacement_raw_by_slot[
+                            item_id
+                        ]
+                    )
+
+                    replacement_seen: set[str] = set()
+
+                    replacement_question = (
+                        _prepare_question_local(
+                            source_chunk=(
+                                replacement_chunk
+                            ),
+                            raw_question=(
+                                replacement_raw
+                            ),
+                            difficulty=(
+                                payload.difficulty
+                            ),
+                            used_question_texts=(
+                                accepted_texts_for_replacement
+                            ),
+                            batch_seen_texts=(
+                                replacement_seen
+                            ),
+                        )
+                    )
+
+                    replacement_evidence = str(
+                        replacement_raw.get(
+                            "evidence_quote",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    (
+                        replacement_ok,
+                        replacement_reason,
+                        replacement_verification,
+                    ) = _fast_grounding_check(
+                        source_text=(
+                            replacement_spec[
+                                "source_text"
+                            ]
+                        ),
+                        question=(
+                            replacement_question
+                        ),
+                        evidence_quote=(
+                            replacement_evidence
+                        ),
+                    )
+
+                    if not replacement_ok:
+                        last_replacement_reason = (
+                            "SRP fast gate failed on "
+                            f"chunk {replacement_chunk.id}: "
+                            + replacement_reason
+                        )
+                        slot_replacement_failed += 1
+                        continue
+
+                    normalized_replacement_text = (
+                        _normalize_compare_text(
+                            replacement_question.question_text
+                        )
+                    )
+
+                    if (
+                        normalized_replacement_text
+                        in accepted_texts_for_replacement
+                    ):
+                        last_replacement_reason = (
+                            "SRP generated a duplicate "
+                            f"question from chunk "
+                            f"{replacement_chunk.id}"
+                        )
+                        slot_replacement_failed += 1
+                        continue
+
+                    accepted_by_id[
+                        item_id
+                    ] = replacement_question
+
+                    verification_by_id[
+                        item_id
+                    ] = {
+                        **replacement_verification,
+                        "verification_mode": (
+                            "fast_grounding_gate_"
+                            "slot_replacement"
+                        ),
+                        "slot_replacement_version": (
+                            SLOT_REPLACEMENT_VERSION
+                        ),
+                        "replaced_source_chunk_id": (
+                            original_chunk_id
+                        ),
+                        "replacement_source_chunk_id": (
+                            int(
+                                replacement_chunk.id
+                            )
+                        ),
+                    }
+
+                    accepted_texts_for_replacement.add(
+                        normalized_replacement_text
+                    )
+
+                    replacement_chunk_id = int(
+                        replacement_chunk.id
+                    )
+                    replacement_used_chunk_ids.add(
+                        replacement_chunk_id
+                    )
+
+                    if (
+                        replacement_chunk_id
+                        not in generation_sources
+                    ):
+                        generation_sources.append(
+                            replacement_chunk_id
+                        )
+
+                    replacement_document_id = int(
+                        replacement_chunk.document_id
+                    )
+                    if (
+                        replacement_document_id
+                        not in quiz_document_ids
+                    ):
+                        quiz_document_ids.append(
+                            replacement_document_id
+                        )
+                        quiz_document_ids.sort()
+
+                    slot_replacement_passed += 1
+                    slot_replacement_source_switches.append(
+                        (
+                            f"{item_id}:"
+                            f"{original_chunk_id}"
+                            f"->{replacement_chunk_id}"
+                        )
+                    )
+
+                    print(
+                        "[QUIZ PEDAGOGY] "
+                        f"{SLOT_REPLACEMENT_VERSION} "
+                        f"slot={item_id} "
+                        f"source={original_chunk_id}"
+                        f"->{replacement_chunk_id} "
+                        f"qsp_score="
+                        f"{qsp_score(replacement_chunk.content or ''):.2f} "
+                        f"duration_ms="
+                        f"{replacement_call_ms:.2f} "
+                        "PASS"
+                    )
+
+                    replacement_success = True
+                    break
+
+                except (
+                    AIProviderError,
+                    json.JSONDecodeError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    # If the provider call itself completed before
+                    # parsing/local validation failed, timing is
+                    # already reported by the provider. Count the
+                    # logical replacement attempt when possible.
+                    slot_replacement_attempts += 1
+                    slot_replacement_failed += 1
+                    last_replacement_reason = (
+                        "SRP replacement failed on "
+                        f"chunk {replacement_chunk.id}: "
+                        f"{exc}"
+                    )
+
+                    print(
+                        "[QUIZ PEDAGOGY] "
+                        f"{SLOT_REPLACEMENT_VERSION} "
+                        f"slot={item_id} "
+                        f"source={original_chunk_id}"
+                        f"->{int(replacement_chunk.id)} "
+                        "FAIL "
+                        f"reason={exc}"
+                    )
+
+            if not replacement_success:
+                remaining_failed_items.append(
+                    {
+                        **failed_item,
+                        "failure_reason": (
+                            str(
+                                failed_item.get(
+                                    "failure_reason",
+                                    "",
+                                )
+                                or ""
+                            )
+                            + "; "
+                            + (
+                                last_replacement_reason
+                                or (
+                                    "SRP found no usable "
+                                    "replacement source"
+                                )
+                            )
+                        ),
+                    }
+                )
+
+        failed_items = (
+            remaining_failed_items
+        )
+
+        print(
+            "[QUIZ PEDAGOGY] "
+            f"{SLOT_REPLACEMENT_VERSION} "
+            f"attempts={slot_replacement_attempts} "
+            f"passed={slot_replacement_passed} "
+            f"failed_attempts={slot_replacement_failed} "
+            f"remaining={len(failed_items)} "
+            "switches="
+            + (
+                ",".join(
+                    slot_replacement_source_switches
+                )
+                if slot_replacement_source_switches
+                else "-"
+            )
+        )
+
     # 10. BOUNDED POST-FALLBACK POLICY
     # =====================================================
 
@@ -13526,9 +16836,11 @@ def generate_quiz(
         "compact_json_recovery="
         "balanced_item_salvage_v1; "
         "compact_output_budget="
-        "120_plus_130_per_slot_v6_1; "
+        "100_plus_70_per_slot_cg_v3_stem_only; "
         f"combined_generation_ai_calls="
         f"{combined_generation_ai_calls}; "
+        f"initial_batch_recovery_calls="
+        f"{initial_batch_recovery_calls}; "
         f"initial_single_recovery_calls="
         f"{initial_single_recovery_calls}; "
         f"combined_initial_max_retries="
