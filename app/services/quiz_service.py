@@ -6390,6 +6390,12 @@ def _sanitize_v6_distractors(
 
     replacements_used = 0
 
+    correct_option_family = (
+        _daq_option_family(
+            answer_text
+        )
+    )
+
     def try_add(
         value: str,
     ) -> bool:
@@ -6499,6 +6505,24 @@ def _sanitize_v6_distractors(
 
         if intrinsic_issue:
             return False
+
+        # DAQ-V1.11 strong semantic option-family guard.
+        #
+        # Apply only when the correct answer has a strong
+        # lexical/structural family. Generic terms remain
+        # governed by the existing DAQ/DQH/DSP rules.
+        if correct_option_family:
+            candidate_family = (
+                _daq_option_family(
+                    text
+                )
+            )
+
+            if (
+                candidate_family
+                != correct_option_family
+            ):
+                return False
 
         # DQH-V1.1 shape-parallelism guard.
         #
@@ -10039,6 +10063,358 @@ def _daq_evidence_text(
     ).strip()
 
 
+def _daq_option_family(
+    value: str,
+) -> str | None:
+    """
+    DAQ-V1.11 strong option-family detector.
+
+    Conservative by design: only strong lexical/structural
+    signals return a family. Generic terms remain governed
+    by the existing DAQ/DQH/DSP pipeline.
+    """
+    text = str(
+        value
+        or ""
+    ).strip()
+
+    if not text:
+        return None
+
+    norm = _normalize_compare_text(
+        text
+    )
+
+    if not norm:
+        return None
+
+    if re.fullmatch(
+        r"(?:1\d{3}|20\d{2})",
+        norm,
+    ):
+        return "DATE"
+
+    if re.search(
+        r"(?<!\d)"
+        r"\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4})"
+        r"(?!\d)",
+        norm,
+    ):
+        return "DATE"
+
+    # Event subfamilies must run before PERSON because
+    # "Chiến dịch Hồ Chí Minh" contains a person's name
+    # but denotes a campaign.
+    event_prefixes = (
+        ("hiệp định", "TREATY"),
+        ("hiệp ước", "TREATY"),
+        ("tuyên ngôn", "DECLARATION"),
+        ("chiến dịch", "CAMPAIGN"),
+        ("chiến thắng", "VICTORY"),
+        ("trận ", "BATTLE"),
+        ("cách mạng", "REVOLUTION"),
+        ("khởi nghĩa", "UPRISING"),
+        ("công cuộc", "REFORM"),
+        ("phong trào", "MOVEMENT"),
+        ("hội nghị", "CONFERENCE"),
+    )
+
+    for prefix, family in event_prefixes:
+        if (
+            norm == prefix.strip()
+            or norm.startswith(
+                prefix
+            )
+        ):
+            return family
+
+    person_prefixes = (
+        "chủ tịch ",
+        "ông ",
+        "bà ",
+        "vua ",
+        "hoàng đế ",
+        "tướng ",
+        "đại tướng ",
+        "giáo sư ",
+        "tiến sĩ ",
+        "president ",
+        "king ",
+        "queen ",
+        "general ",
+    )
+
+    if any(
+        norm.startswith(
+            prefix
+        )
+        for prefix in person_prefixes
+    ):
+        return "PERSON"
+
+    generic_event_prefixes = (
+        "sự ra đời ",
+        "sự thành lập ",
+        "sự kiện ",
+    )
+
+    if any(
+        norm.startswith(
+            prefix
+        )
+        for prefix in generic_event_prefixes
+    ):
+        return "EVENT_OTHER"
+
+    return None
+
+
+def _daq_correct_answer_issue(
+    value: str,
+) -> str | None:
+    """
+    Reject metadata/headings/source-introduction labels as
+    backend correct-answer candidates.
+    """
+    text = str(
+        value
+        or ""
+    ).strip()
+
+    if not text:
+        return (
+            "DAQ: empty correct-answer candidate"
+        )
+
+    intrinsic_fn = globals().get(
+        "_answer_candidate_intrinsic_issue"
+    )
+
+    if callable(
+        intrinsic_fn
+    ):
+        intrinsic_issue = intrinsic_fn(
+            text
+        )
+
+        if intrinsic_issue:
+            return str(
+                intrinsic_issue
+            )
+
+    norm = _normalize_compare_text(
+        text
+    )
+
+    meta_patterns = (
+        r"^một\s+số\b",
+        r"^các\s+mốc\b",
+        r"^mốc\s+dùng\s+để\b",
+        r"\bdữ\s+liệu\s+kiểm\s+thử\b",
+        r"^chương\s+\d+\b",
+        r"^bài\s+\d+\b",
+        r"^phần\s+\d+\b",
+        r"\bnhư\s+sau\b",
+        r"\bsau\s+đây\b",
+        r"^bao\s+gồm\b",
+        r"^gồm\b",
+    )
+
+    for pattern in meta_patterns:
+        if re.search(
+            pattern,
+            norm,
+            flags=re.UNICODE,
+        ):
+            return (
+                "DAQ: meta/non-instructional "
+                "correct-answer candidate"
+            )
+
+    return None
+
+
+def _daq_correct_answer_text(
+    question,
+) -> str | None:
+    """
+    Extract exactly one marked-correct option text from either
+    a raw dict question or a QuestionCreate-like object.
+    """
+    if isinstance(
+        question,
+        dict,
+    ):
+        options = (
+            question.get(
+                "options",
+                [],
+            )
+            or []
+        )
+    else:
+        options = (
+            getattr(
+                question,
+                "options",
+                [],
+            )
+            or []
+        )
+
+    correct_texts: list[str] = []
+
+    for option in options:
+        if isinstance(
+            option,
+            dict,
+        ):
+            is_correct = bool(
+                option.get(
+                    "is_correct",
+                    False,
+                )
+            )
+            option_text = str(
+                option.get(
+                    "option_text",
+                    "",
+                )
+                or ""
+            ).strip()
+        else:
+            is_correct = bool(
+                getattr(
+                    option,
+                    "is_correct",
+                    False,
+                )
+            )
+            option_text = str(
+                getattr(
+                    option,
+                    "option_text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+        if (
+            is_correct
+            and option_text
+        ):
+            correct_texts.append(
+                option_text
+            )
+
+    if len(
+        correct_texts
+    ) != 1:
+        return None
+
+    return correct_texts[
+        0
+    ]
+
+
+def _daq_collect_correct_answer_norms(
+    questions,
+) -> set[str]:
+    """
+    Build the request-wide reservation set used by isolated
+    batch/single recovery calls.
+
+    Only already-materialized correct answers are reserved.
+    Invalid/incomplete questions are ignored here and remain
+    governed by existing structural validation.
+    """
+    reserved: set[str] = set()
+
+    for question in (
+        questions
+        or []
+    ):
+        correct_text = (
+            _daq_correct_answer_text(
+                question
+            )
+        )
+
+        if not correct_text:
+            continue
+
+        norm = _normalize_compare_text(
+            correct_text
+        )
+
+        if norm:
+            reserved.add(
+                norm
+            )
+
+    return reserved
+
+
+def _daq_assert_unique_correct_answers(
+    questions: list,
+) -> None:
+    """
+    Final persistence guard.
+
+    Recovery should already avoid reserved answers. This guard
+    is defense-in-depth so an unexpected later path cannot save
+    two questions with the same normalized correct answer.
+    """
+    seen: dict[
+        str,
+        int,
+    ] = {}
+
+    for index, question in enumerate(
+        questions,
+        start=1,
+    ):
+        correct_text = (
+            _daq_correct_answer_text(
+                question
+            )
+        )
+
+        if not correct_text:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "DAQ-V1.11 final quiz guard requires "
+                    "exactly one correct option per question: "
+                    f"question_index={index}"
+                ),
+            )
+
+        norm = _normalize_compare_text(
+            correct_text
+        )
+
+        if (
+            norm
+            and norm in seen
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "DAQ-V1.11 final quiz guard rejected "
+                    "duplicate correct answers across recovery: "
+                    f"question_index={index}, "
+                    f"first_question_index={seen[norm]}, "
+                    f"answer={correct_text!r}"
+                ),
+            )
+
+        if norm:
+            seen[
+                norm
+            ] = index
+
+
 def _daq_viable_distractor_pool(
     *,
     correct_text: str,
@@ -10048,6 +10424,21 @@ def _daq_viable_distractor_pool(
     global_answer_rows: list[dict],
     fallback_candidates: list[str],
 ) -> list[str]:
+    correct_issue = (
+        _daq_correct_answer_issue(
+            correct_text
+        )
+    )
+
+    if correct_issue:
+        print(
+            "[QUIZ PEDAGOGY] "
+            "DAQ-V1.11 reject-correct "
+            f"answer={correct_text!r} "
+            f"reason={correct_issue}"
+        )
+        return []
+
     pool: list[str] = []
 
     # DAQ-V1.5 typed local-label isolation:
@@ -10182,6 +10573,78 @@ def _daq_viable_distractor_pool(
     return merged
 
 
+def _daq_match_unique_viable_candidates(
+    candidate_map: dict[str, list[tuple]],
+    *,
+    reserved_correct_norms: set[str] | None = None,
+) -> dict[str, tuple] | None:
+    """DAQ-V1.12 request-wide one-to-one answer assignment."""
+    reserved = set(reserved_correct_norms or set())
+    normalized_candidates: dict[str, list[tuple]] = {}
+
+    for slot_id, candidates in candidate_map.items():
+        usable: list[tuple] = []
+        seen_norms: set[str] = set()
+
+        for candidate in candidates:
+            priority, row, _pool, _profile = candidate
+            if not priority or priority[0] != 0:
+                continue
+
+            norm = _normalize_compare_text(
+                str(row.get("answer_text", "") or "")
+            )
+            if not norm or norm in reserved or norm in seen_norms:
+                continue
+
+            seen_norms.add(norm)
+            usable.append(candidate)
+
+        usable.sort(key=lambda item: item[0])
+        if not usable:
+            return None
+        normalized_candidates[str(slot_id)] = usable
+
+    # Minimum Remaining Values: protect the most constrained slot first.
+    ordered_slots = sorted(
+        normalized_candidates,
+        key=lambda slot_id: (
+            len(normalized_candidates[slot_id]),
+            slot_id,
+        ),
+    )
+
+    chosen_by_slot: dict[str, tuple] = {}
+    used_norms = set(reserved)
+
+    def search(index: int) -> bool:
+        if index >= len(ordered_slots):
+            return True
+
+        slot_id = ordered_slots[index]
+        for candidate in normalized_candidates[slot_id]:
+            _priority, row, _pool, _profile = candidate
+            norm = _normalize_compare_text(
+                str(row.get("answer_text", "") or "")
+            )
+            if not norm or norm in used_norms:
+                continue
+
+            used_norms.add(norm)
+            chosen_by_slot[slot_id] = candidate
+            if search(index + 1):
+                return True
+            chosen_by_slot.pop(slot_id, None)
+            used_norms.remove(norm)
+
+        return False
+
+    if not search(0):
+        return None
+
+    return chosen_by_slot
+
+
 def _daq_rebalance_fixed_choices_for_viability(
     *,
     slot_specs: list[dict],
@@ -10190,420 +10653,141 @@ def _daq_rebalance_fixed_choices_for_viability(
     answer_by_slot: dict,
     distractor_candidates_by_slot: dict,
     fixed_choice_by_slot: dict,
+    reserved_correct_norms: set[str] | None = None,
 ) -> dict:
-    """
-    Prefer backend-owned correct answers that can actually
-    support three safe distractors BEFORE an AI call.
-
-    This is especially important when one short source chunk
-    is reused for several requested quiz slots.
-    """
+    """DAQ-V1.12 global viability evaluation + unique answer matching."""
     source_by_slot = {
-        str(
-            spec.get(
-                "id"
-            )
-        ): str(
-            spec.get(
-                "source_text",
-                "",
-            )
-            or ""
-        )
+        str(spec.get("id")): str(spec.get("source_text", "") or "")
         for spec in slot_specs
     }
 
     global_answer_rows: list[dict] = []
+    for raw_slot_id, answer_bucket in answer_by_slot.items():
+        slot_id = str(raw_slot_id)
+        evidence_bucket = evidence_by_slot.get(slot_id, {}) or {}
 
-    for (
-        raw_slot_id,
-        answer_bucket,
-    ) in (
-        answer_by_slot.items()
-    ):
-        slot_id = str(
-            raw_slot_id
-        )
-
-        evidence_bucket = (
-            evidence_by_slot.get(
-                slot_id,
-                {},
+        for raw_answer_id, raw_spec in (answer_bucket or {}).items():
+            spec = raw_spec if isinstance(raw_spec, dict) else {"text": raw_spec}
+            answer_text = str(spec.get("text", "") or "").strip()
+            evidence_id = str(spec.get("evidence_id", "") or "").strip()
+            evidence_text = _daq_evidence_text(
+                evidence_bucket,
+                evidence_id,
+                answer_spec=spec,
             )
-            or {}
-        )
-
-        for (
-            raw_answer_id,
-            raw_spec,
-        ) in (
-            (
-                answer_bucket
-                or {}
-            ).items()
-        ):
-            spec = (
-                raw_spec
-                if isinstance(
-                    raw_spec,
-                    dict,
-                )
-                else {
-                    "text": raw_spec,
-                }
-            )
-
-            answer_text = str(
-                spec.get(
-                    "text",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            evidence_id = str(
-                spec.get(
-                    "evidence_id",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            evidence_text = (
-                _daq_evidence_text(
-                    evidence_bucket,
-                    evidence_id,
-                    answer_spec=spec,
-                )
-            )
-
-            if (
-                answer_text
-                and evidence_id
-                and evidence_text
-            ):
+            if answer_text and evidence_id and evidence_text:
                 global_answer_rows.append(
                     {
-                        "slot_id": (
-                            slot_id
-                        ),
-                        "answer_id": str(
-                            raw_answer_id
-                        ),
-                        "answer_text": (
-                            answer_text
-                        ),
-                        "evidence_id": (
-                            evidence_id
-                        ),
-                        "evidence_text": (
-                            evidence_text
-                        ),
+                        "slot_id": slot_id,
+                        "answer_id": str(raw_answer_id),
+                        "answer_text": answer_text,
+                        "evidence_id": evidence_id,
+                        "evidence_text": evidence_text,
                     }
                 )
 
-    used_answers: set[str] = set()
-    rebalanced: dict = {}
+    reserved = set(reserved_correct_norms or set())
+    candidate_map: dict[str, list[tuple]] = {}
+    current_by_slot: dict[str, dict] = {}
 
     for slot in slots:
-        slot_id = str(
-            slot.get(
-                "slot"
-            )
-        )
-
-        current = dict(
-            fixed_choice_by_slot.get(
-                slot_id,
-                {},
-            )
-            or {}
-        )
-
-        source_text = (
-            source_by_slot.get(
-                slot_id,
-                "",
-            )
-        )
-
-        evidence_bucket = (
-            evidence_by_slot.get(
-                slot_id,
-                {},
-            )
-            or {}
-        )
-
+        slot_id = str(slot.get("slot"))
+        current = dict(fixed_choice_by_slot.get(slot_id, {}) or {})
+        current_by_slot[slot_id] = current
+        source_text = source_by_slot.get(slot_id, "")
+        evidence_bucket = evidence_by_slot.get(slot_id, {}) or {}
         candidate_rows: list[dict] = []
 
-        current_text = str(
-            current.get(
-                "answer_text",
-                "",
-            )
-            or ""
-        ).strip()
-
+        current_text = str(current.get("answer_text", "") or "").strip()
         if current_text:
             candidate_rows.append(
                 {
                     "slot_id": slot_id,
-                    "answer_id": str(
-                        current.get(
-                            "answer_id",
-                            "",
-                        )
-                        or ""
-                    ),
-                    "answer_text": (
-                        current_text
-                    ),
-                    "evidence_id": str(
-                        current.get(
-                            "evidence_id",
-                            "",
-                        )
-                        or ""
-                    ),
-                    "evidence_text": str(
-                        current.get(
-                            "evidence_text",
-                            "",
-                        )
-                        or ""
-                    ),
+                    "answer_id": str(current.get("answer_id", "") or ""),
+                    "answer_text": current_text,
+                    "evidence_id": str(current.get("evidence_id", "") or ""),
+                    "evidence_text": str(current.get("evidence_text", "") or ""),
                     "is_current": True,
                 }
             )
 
-        answer_bucket = (
-            answer_by_slot.get(
-                slot_id,
-                {},
+        answer_bucket = answer_by_slot.get(slot_id, {}) or {}
+        for raw_answer_id, raw_spec in answer_bucket.items():
+            spec = raw_spec if isinstance(raw_spec, dict) else {"text": raw_spec}
+            answer_text = str(spec.get("text", "") or "").strip()
+            evidence_id = str(spec.get("evidence_id", "") or "").strip()
+            evidence_text = _daq_evidence_text(
+                evidence_bucket,
+                evidence_id,
+                answer_spec=spec,
             )
-            or {}
-        )
-
-        for (
-            raw_answer_id,
-            raw_spec,
-        ) in answer_bucket.items():
-            spec = (
-                raw_spec
-                if isinstance(
-                    raw_spec,
-                    dict,
-                )
-                else {
-                    "text": raw_spec,
-                }
-            )
-
-            answer_text = str(
-                spec.get(
-                    "text",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            evidence_id = str(
-                spec.get(
-                    "evidence_id",
-                    "",
-                )
-                or ""
-            ).strip()
-
-            evidence_text = (
-                _daq_evidence_text(
-                    evidence_bucket,
-                    evidence_id,
-                    answer_spec=spec,
-                )
-            )
-
-            if (
-                not answer_text
-                or not evidence_id
-                or not evidence_text
-            ):
+            if not answer_text or not evidence_id or not evidence_text:
                 continue
-
             if any(
-                _normalize_compare_text(
-                    row.get(
-                        "answer_text",
-                        "",
-                    )
-                )
-                == _normalize_compare_text(
-                    answer_text
-                )
+                _normalize_compare_text(row.get("answer_text", ""))
+                == _normalize_compare_text(answer_text)
                 for row in candidate_rows
             ):
                 continue
-
             candidate_rows.append(
                 {
                     "slot_id": slot_id,
-                    "answer_id": str(
-                        raw_answer_id
-                    ),
-                    "answer_text": (
-                        answer_text
-                    ),
-                    "evidence_id": (
-                        evidence_id
-                    ),
-                    "evidence_text": (
-                        evidence_text
-                    ),
+                    "answer_id": str(raw_answer_id),
+                    "answer_text": answer_text,
+                    "evidence_id": evidence_id,
+                    "evidence_text": evidence_text,
                     "is_current": False,
                 }
             )
 
-        evaluated: list[
-            tuple[
-                tuple,
-                dict,
-                list[str],
-                object,
-            ]
-        ] = []
-
+        evaluated: list[tuple[tuple, dict, list[str], object]] = []
         for row in candidate_rows:
-            answer_text = str(
-                row[
-                    "answer_text"
-                ]
+            answer_text = str(row["answer_text"])
+            evidence_text = str(row["evidence_text"])
+            profile = infer_knowledge_profile(
+                answer_text=answer_text,
+                evidence_text=evidence_text,
+                source_text=source_text,
+            )
+            pool = _daq_viable_distractor_pool(
+                correct_text=answer_text,
+                evidence_text=evidence_text,
+                source_text=source_text,
+                profile=profile,
+                global_answer_rows=global_answer_rows,
+                fallback_candidates=list(
+                    distractor_candidates_by_slot.get(slot_id, []) or []
+                ),
             )
 
-            evidence_text = str(
-                row[
-                    "evidence_text"
-                ]
-            )
-
-            profile = (
-                infer_knowledge_profile(
-                    answer_text=(
-                        answer_text
-                    ),
-                    evidence_text=(
-                        evidence_text
-                    ),
-                    source_text=(
-                        source_text
-                    ),
-                )
-            )
-
-            pool = (
-                _daq_viable_distractor_pool(
-                    correct_text=(
-                        answer_text
-                    ),
-                    evidence_text=(
-                        evidence_text
-                    ),
-                    source_text=(
-                        source_text
-                    ),
-                    profile=(
-                        profile
-                    ),
-                    global_answer_rows=(
-                        global_answer_rows
-                    ),
-                    fallback_candidates=list(
-                        distractor_candidates_by_slot.get(
-                            slot_id,
-                            [],
-                        )
-                        or []
-                    ),
-                )
-            )
-
-            # DAQ-V1.9 candidate-diagnostics:
-            # expose WHY a grounded candidate is or is not viable.
             safe: list[str] = []
             sanitize_error: str | None = None
-
             try:
-                safe, _ = (
-                    _sanitize_v6_distractors(
-                        model_distractors=[],
-                        answer_text=(
-                            answer_text
-                        ),
-                        evidence_quote=(
-                            evidence_text
-                        ),
-                        slot_answers={
-                            str(
-                                row[
-                                    "answer_id"
-                                ]
-                            ): {
-                                "text": (
-                                    answer_text
-                                ),
-                            },
-                        },
-                        extra_candidates=(
-                            pool
-                        ),
-                    )
+                safe, _ = _sanitize_v6_distractors(
+                    model_distractors=[],
+                    answer_text=answer_text,
+                    evidence_quote=evidence_text,
+                    slot_answers={
+                        str(row["answer_id"]): {"text": answer_text}
+                    },
+                    extra_candidates=pool,
                 )
-
-                viable = (
-                    len(
-                        safe
-                    )
-                    == 3
-                )
-
+                viable = len(safe) == 3
             except ValueError as exc:
                 viable = False
-                sanitize_error = str(
-                    exc
-                )
+                sanitize_error = str(exc)
 
-            norm = (
-                _normalize_compare_text(
-                    answer_text
-                )
-            )
-
+            norm = _normalize_compare_text(answer_text)
             structured_count = len(
-                structured_distractor_variants(
-                    answer_text,
-                    profile=profile,
-                )
+                structured_distractor_variants(answer_text, profile=profile)
             )
-
+            reserved_now = norm in reserved
             priority = (
-                0
-                if viable
-                else 1,
-                0
-                if norm
-                not in used_answers
-                else 1,
-                0
-                if bool(
-                    row.get(
-                        "is_current"
-                    )
-                )
-                else 1,
+                0 if viable else 1,
+                0 if not reserved_now else 1,
+                0 if bool(row.get("is_current")) else 1,
                 -structured_count,
-                -len(
-                    pool
-                ),
+                -len(pool),
                 norm,
             )
 
@@ -10617,137 +10801,89 @@ def _daq_rebalance_fixed_choices_for_viability(
                 f"pool={len(pool)} "
                 f"safe={len(safe)} "
                 f"viable={viable} "
-                f"used={norm in used_answers} "
+                f"used={reserved_now} "
                 f"current={bool(row.get('is_current'))} "
                 f"safe_values={safe!r} "
                 f"error={sanitize_error!r}"
             )
+            evaluated.append((priority, row, pool, profile))
 
-            evaluated.append(
-                (
-                    priority,
-                    row,
-                    pool,
-                    profile,
-                )
-            )
+        evaluated.sort(key=lambda item: item[0])
+        candidate_map[slot_id] = evaluated
 
-        evaluated.sort(
-            key=lambda item: item[0]
+        viable_unused = [
+            item
+            for item in evaluated
+            if item[0][0] == 0
+            and _normalize_compare_text(
+                str(item[1].get("answer_text", "") or "")
+            ) not in reserved
+        ]
+        print(
+            "[QUIZ PEDAGOGY] "
+            "DAQ-V1.12 global-match candidates "
+            f"slot={slot_id} "
+            f"viable_unused={len(viable_unused)} "
+            f"values={[str(item[1].get('answer_text', '')) for item in viable_unused]!r}"
         )
 
-        # DAQ-V1.6 hard unique correct-answer capacity.
-        chosen = None
+    assignment = _daq_match_unique_viable_candidates(
+        candidate_map,
+        reserved_correct_norms=reserved,
+    )
 
-        for candidate in evaluated:
-            (
-                candidate_priority,
-                candidate_row,
-                _candidate_pool,
-                _candidate_profile,
-            ) = candidate
-
-            candidate_norm = (
-                _normalize_compare_text(
-                    candidate_row.get(
-                        "answer_text",
-                        "",
-                    )
-                )
+    if assignment is None:
+        capacities = {
+            slot_id: len(
+                [
+                    item
+                    for item in candidates
+                    if item[0][0] == 0
+                    and _normalize_compare_text(
+                        str(item[1].get("answer_text", "") or "")
+                    ) not in reserved
+                ]
             )
-
-            if (
-                candidate_priority[0] == 0
-                and candidate_norm
-                and candidate_norm not in used_answers
-            ):
-                chosen = candidate
-                break
-
-        if chosen is None:
-            print(
-                "[QUIZ PEDAGOGY] "
-                "DAQ-V1.6 viability "
-                f"slot={slot_id} "
-                "NO_UNIQUE_VIABLE_ALTERNATIVE"
-            )
-
-            raise QuizPreflightCapacityError(
-                "DAQ-V1.6 preflight cannot produce the requested "
-                "number of unique questions from the selected source: "
-                f"slot={slot_id} has no unused answer with three "
-                "safe distractors"
-            )
-
-        (
-            _priority,
-            row,
-            pool,
-            profile,
-        ) = chosen
-
-        chosen_text = str(
-            row[
-                "answer_text"
-            ]
+            for slot_id, candidates in candidate_map.items()
+        }
+        print(
+            "[QUIZ PEDAGOGY] "
+            "DAQ-V1.12 global-match NO_GLOBAL_UNIQUE_ASSIGNMENT "
+            f"capacities={capacities!r}"
+        )
+        raise QuizPreflightCapacityError(
+            "DAQ-V1.12 preflight cannot find a request-wide one-to-one "
+            "assignment of grounded correct answers with three safe "
+            "distractors for every requested slot"
         )
 
-        chosen_norm = (
-            _normalize_compare_text(
-                chosen_text
-            )
-        )
+    rebalanced: dict = {}
+    for slot in slots:
+        slot_id = str(slot.get("slot"))
+        _priority, row, pool, profile = assignment[slot_id]
+        chosen_text = str(row["answer_text"])
+        current = current_by_slot.get(slot_id, {})
+        current_text = str(current.get("answer_text", "") or "").strip()
 
-        used_answers.add(
-            chosen_norm
-        )
-
-        new_choice = dict(
-            current
-        )
-
+        new_choice = dict(current)
         new_choice.update(
             {
-                "answer_id": (
-                    row[
-                        "answer_id"
-                    ]
-                ),
-                "answer_text": (
-                    chosen_text
-                ),
-                "evidence_id": (
-                    row[
-                        "evidence_id"
-                    ]
-                ),
-                "evidence_text": (
-                    row[
-                        "evidence_text"
-                    ]
-                ),
+                "answer_id": row["answer_id"],
+                "answer_text": chosen_text,
+                "evidence_id": row["evidence_id"],
+                "evidence_text": row["evidence_text"],
             }
         )
-
-        rebalanced[
-            slot_id
-        ] = new_choice
-
-        old_text = (
-            current_text
-            or "(none)"
-        )
+        rebalanced[slot_id] = new_choice
 
         print(
             "[QUIZ PEDAGOGY] "
-            "DAQ-V1.4 viability "
+            "DAQ-V1.12 global-match assignment "
             f"slot={slot_id} "
             f"type={profile.knowledge_type} "
             f"domain={profile.domain} "
             f"pool={len(pool)} "
-            f"answer={old_text!r}"
-            "->"
-            f"{chosen_text!r}"
+            f"answer={current_text or '(none)'!r}->{chosen_text!r}"
         )
 
     return rebalanced
@@ -10764,6 +10900,7 @@ def _generate_compact_slot_questions(
     ]
     | None = None,
     allow_partial_response: bool = False,
+    reserved_correct_norms: set[str] | None = None,
 ) -> tuple[
     dict[str, dict],
     str | None,
@@ -10845,6 +10982,9 @@ def _generate_compact_slot_questions(
             ),
             fixed_choice_by_slot=(
                 fixed_choice_by_slot
+            ),
+            reserved_correct_norms=(
+                reserved_correct_norms
             ),
         )
     )
@@ -14534,6 +14674,11 @@ def generate_quiz(
                 slot_specs=missing_initial_specs,
                 difficulty=payload.difficulty,
                 allow_partial_response=True,
+                reserved_correct_norms=(
+                    _daq_collect_correct_answer_norms(
+                        raw_by_slot.values()
+                    )
+                ),
             )
 
             combined_generation_ai_calls += 1
@@ -14618,6 +14763,11 @@ def generate_quiz(
                             payload.difficulty
                         ),
                         allow_partial_response=False,
+                        reserved_correct_norms=(
+                            _daq_collect_correct_answer_norms(
+                                raw_by_slot.values()
+                            )
+                        ),
                     )
                 )
 
@@ -15120,6 +15270,19 @@ def generate_quiz(
                         retry_context
                     ),
                     allow_partial_response=True,
+                    reserved_correct_norms=(
+                        _daq_collect_correct_answer_norms(
+                            outcome.get(
+                                "question"
+                            )
+                            for outcome
+                            in fast_outcomes.values()
+                            if outcome.get(
+                                "question"
+                            )
+                            is not None
+                        )
+                    ),
                 )
             )
 
@@ -15481,6 +15644,19 @@ def generate_quiz(
                         single_context
                     ),
                     allow_partial_response=False,
+                    reserved_correct_norms=(
+                        _daq_collect_correct_answer_norms(
+                            outcome.get(
+                                "question"
+                            )
+                            for outcome
+                            in fast_outcomes.values()
+                            if outcome.get(
+                                "question"
+                            )
+                            is not None
+                        )
+                    ),
                 )
             )
 
@@ -16251,6 +16427,11 @@ def generate_quiz(
                             replacement_context
                         ),
                         allow_partial_response=False,
+                        reserved_correct_norms=(
+                            _daq_collect_correct_answer_norms(
+                                accepted_by_id.values()
+                            )
+                        ),
                     )
 
                     slot_replacement_attempts += 1
@@ -16715,6 +16896,10 @@ def generate_quiz(
     # =====================================================
     # 12. CREATE PAYLOAD
     # =====================================================
+
+    _daq_assert_unique_correct_answers(
+        generated_questions
+    )
 
     create_payload = QuizCreate(
         subject_id=(
