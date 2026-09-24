@@ -458,7 +458,22 @@ def structural_chunk_text(
         )
 
         if block.heading is None:
-            section_id = None
+            # SSA-LI-V1 headingless semantic ownership:
+            # a document with one semantic section should not
+            # produce analytics-invisible chunks.
+            if len(section_list) == 1:
+                section_id = int(
+                    _section_value(
+                        section_list[0],
+                        "id",
+                    )
+                )
+            else:
+                section_id = resolve_semantic_section_id(
+                    block_text=block.content,
+                    structural_heading=None,
+                    sections=section_list,
+                )
 
         elif (
             chapter_number is not None

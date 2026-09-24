@@ -28,6 +28,7 @@ from app.services.ai_provider import AIProviderError, get_ai_provider
 from app.services.structural_chunker import (
     SSA_SBC_VERSION,
     structural_chunk_text,
+    split_structural_blocks,
 )
 
 settings = get_settings()
@@ -364,6 +365,128 @@ def _pgvector_enabled(db: Session) -> bool:
         return False
 
 
+# =========================================================
+# SSA-LI-V1 — LEARNING INTEGRITY / SECTION BOOTSTRAP
+# =========================================================
+
+
+def _section_title_key(value: str) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or "").strip().casefold(),
+    )
+
+
+def _ensure_document_sections(
+    db: Session,
+    doc: Document,
+    cleaned_text: str,
+) -> list[DocumentSection]:
+    # Existing sections are preserved.  For a new document,
+    # unique structural headings become semantic sections.
+    # Headingless documents receive one deterministic section
+    # so their quiz activity can update topic_mastery.
+
+    existing = list(
+        db.scalars(
+            select(DocumentSection)
+            .where(
+                DocumentSection.document_id == doc.id
+            )
+            .order_by(
+                DocumentSection.section_order,
+                DocumentSection.id,
+            )
+        ).all()
+    )
+
+    if existing:
+        return existing
+
+    blocks = split_structural_blocks(
+        cleaned_text
+    )
+
+    titles: list[str] = []
+    seen: set[str] = set()
+
+    for block in blocks:
+        heading = str(
+            block.heading
+            or ""
+        ).strip()
+
+        if not heading:
+            continue
+
+        key = _section_title_key(
+            heading
+        )
+
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        titles.append(
+            heading[:500]
+        )
+
+    if not titles:
+        fallback = Path(
+            str(
+                doc.original_name
+                or "Nội dung tài liệu"
+            )
+        ).stem.strip()
+
+        titles = [
+            (fallback or "Nội dung tài liệu")[:500]
+        ]
+
+    for order, title in enumerate(
+        titles,
+        start=1,
+    ):
+        db.add(
+            DocumentSection(
+                document_id=doc.id,
+                parent_section_id=None,
+                title=title,
+                section_level=1,
+                section_order=order,
+            )
+        )
+
+    db.flush()
+
+    created = list(
+        db.scalars(
+            select(DocumentSection)
+            .where(
+                DocumentSection.document_id == doc.id
+            )
+            .order_by(
+                DocumentSection.section_order,
+                DocumentSection.id,
+            )
+        ).all()
+    )
+
+    if not created:
+        raise ValueError(
+            "SSA-LI-V1 could not create document sections"
+        )
+
+    print(
+        "[LEARNING INTEGRITY] "
+        f"SSA-LI-V1 document={doc.id} "
+        f"sections_created={len(created)}"
+    )
+
+    return created
+
+
 def process_document(db: Session, doc: Document) -> tuple[int, int]:
     # Preserve the last usable state before re-indexing.
     previous_status = str(doc.status or "UPLOADED")
@@ -392,17 +515,10 @@ def process_document(db: Session, doc: Document) -> tuple[int, int]:
         job.stage = "CHUNK"
         job.progress_pct = 35
 
-        sections = list(
-            db.scalars(
-                select(DocumentSection)
-                .where(
-                    DocumentSection.document_id == doc.id
-                )
-                .order_by(
-                    DocumentSection.section_order,
-                    DocumentSection.id,
-                )
-            ).all()
+        sections = _ensure_document_sections(
+            db,
+            doc,
+            cleaned,
         )
 
         structural_chunks = structural_chunk_text(
