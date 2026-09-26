@@ -952,7 +952,7 @@ CREATE TABLE public.quizzes (
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     CONSTRAINT quizzes_difficulty_check CHECK (((difficulty)::text = ANY ((ARRAY['EASY'::character varying, 'MEDIUM'::character varying, 'HARD'::character varying, 'MIXED'::character varying])::text[]))),
     CONSTRAINT quizzes_duration_minutes_check CHECK (((duration_minutes IS NULL) OR (duration_minutes > 0))),
-    CONSTRAINT quizzes_generation_mode_check CHECK (((generation_mode)::text = ANY ((ARRAY['AI'::character varying, 'MANUAL'::character varying, 'IMPORTED'::character varying, 'FORKED'::character varying])::text[]))),
+    CONSTRAINT quizzes_generation_mode_check CHECK (((generation_mode)::text = ANY ((ARRAY['AI'::character varying, 'MANUAL'::character varying, 'IMPORTED'::character varying, 'FORKED'::character varying, 'V5_DETERMINISTIC'::character varying])::text[]))),
     CONSTRAINT quizzes_question_count_check CHECK ((question_count >= 0)),
     CONSTRAINT quizzes_status_check CHECK (((status)::text = ANY ((ARRAY['DRAFT'::character varying, 'PUBLISHED'::character varying, 'ARCHIVED'::character varying])::text[]))),
     CONSTRAINT quizzes_visibility_check CHECK (((visibility)::text = ANY ((ARRAY['PRIVATE'::character varying, 'UNLISTED'::character varying, 'PUBLIC'::character varying])::text[])))
