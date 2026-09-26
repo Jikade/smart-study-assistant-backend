@@ -6,21 +6,18 @@ from typing import Iterable, TYPE_CHECKING
 
 from app.services.quiz_v5.distractors import (
     PlanBuildDiagnostics,
-    build_validated_quiz_plan,
+)
+from app.services.quiz_v5.engine import (
+    run_quiz_v5_engine,
 )
 from app.services.quiz_v5.extractor import (
     ChunkInput,
-    extract_knowledge_objects,
 )
 from app.services.quiz_v5.models import (
     KnowledgeObject,
     PlannedQuestion,
     QuestionBlueprint,
 )
-from app.services.quiz_v5.planner import (
-    plan_blueprints,
-)
-
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
@@ -329,37 +326,22 @@ def shadow_from_chunks(
         )
     )
 
-    source_chars = sum(
-        len(str(chunk.text or ""))
-        for chunk in chunks
-    )
-
-    knowledge = extract_knowledge_objects(
+    engine_result = run_quiz_v5_engine(
         chunks,
+        target=target,
         subject_family=subject_family,
-    )
-
-    blueprints = plan_blueprints(
-        knowledge
-    )
-
-    planned, diagnostics = (
-        build_validated_quiz_plan(
-            blueprints,
-            target=target,
-            max_per_section=max_per_section,
-        )
+        max_per_section=max_per_section,
     )
 
     return _make_report(
         document_ids=document_ids,
         target=target,
         chunks=chunks,
-        source_chars=source_chars,
-        knowledge=knowledge,
-        blueprints=blueprints,
-        planned=planned,
-        diagnostics=diagnostics,
+        source_chars=engine_result.source_chars,
+        knowledge=list(engine_result.knowledge),
+        blueprints=list(engine_result.blueprints),
+        planned=list(engine_result.questions),
+        diagnostics=engine_result.diagnostics,
     )
 
 
