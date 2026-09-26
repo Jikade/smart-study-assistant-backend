@@ -635,7 +635,7 @@ def process_document(db: Session, doc: Document) -> tuple[int, int]:
         hard_heading_re = re.compile(
             r"(?im)^\s*"
             r"(?:CHƯƠNG|CHUONG|CHAPTER|PHẦN|PHAN|PART)"
-            r"\s+(?:\d+|[IVXLCDM]+)"
+            r"\s+(?:\d+|[IVXLCDM]+)\b"
         )
 
         for row in chunk_rows:

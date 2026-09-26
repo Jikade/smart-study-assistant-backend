@@ -5,7 +5,7 @@ import re
 import unicodedata
 from typing import Any, Iterable
 
-SSA_SBC_VERSION = "ssa-sbc-v1.2"
+SSA_SBC_VERSION = "ssa-sbc-v1.3"
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class StructuralChunk:
 
 _HARD_HEADING_RE = re.compile(
     r"(?im)^\s*(?:CHƯƠNG|CHUONG|CHAPTER|PHẦN|PHAN|PART)\s+"
-    r"(?:\d+|[IVXLCDM]+)\s*[:.\-–—]?[^\n]*$"
+    r"(?:\d+|[IVXLCDM]+)\b\s*[:.\-–—]?[^\n]*$"
 )
 
 

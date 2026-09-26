@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from app.services.structural_chunker import (
     SSA_SBC_VERSION,
     extract_chapter_number,
+    learning_block_skip_reasons,
     structural_chunk_text,
 )
 
@@ -71,6 +72,18 @@ CHƯƠNG 5: KTTT ĐỊNH HƯỚNG XÃ HỘI CHỦ NGHĨA
 Kinh tế thị trường định hướng xã hội chủ nghĩa ở Việt Nam.
 """.strip()
 
+    reasons = learning_block_skip_reasons(
+        source
+    )
+
+    # In this V1.1 fixture, only the short headingless preamble
+    # satisfies the V1.2+ learning-filter threshold.
+    # The repeated chapter bodies are intentionally short (< 500 chars),
+    # so the conservative repeated-summary rule must NOT remove them.
+    assert reasons == {
+        0: "short_preamble"
+    }, reasons
+
     chunks = structural_chunk_text(
         source,
         sections=sections,
@@ -86,18 +99,20 @@ Kinh tế thị trường định hướng xã hội chủ nghĩa ở Việt Nam
             chunk.section_id,
         )
 
-    # block 0 is preamble/title page.
-    assert block_map[0] is None, block_map
+    # V1.2+ removes the preamble entirely instead of keeping it
+    # as block 0 with section_id=None.
+    assert 0 not in block_map, block_map
 
-    # First chapter occurrences.
+    # First chapter occurrences remain present for this fixture
+    # because they do not meet the conservative summary-skip threshold.
     assert block_map[1] == 1, block_map
     assert block_map[2] == 2, block_map
     assert block_map[3] == 2, block_map
     assert block_map[4] == 4, block_map
     assert block_map[5] == 3, block_map
 
-    # Repeated body chapter occurrences must reuse the
-    # chapter mapping rather than drift semantically.
+    # Repeated body chapter occurrences must reuse the same semantic
+    # chapter ownership rather than drifting.
     assert block_map[6] == 1, block_map
     assert block_map[7] == 2, block_map
     assert block_map[8] == 2, block_map
@@ -108,14 +123,18 @@ Kinh tế thị trường định hướng xã hội chủ nghĩa ở Việt Nam
         "CHƯƠNG 4: CẠNH TRANH VÀ ĐỘC QUYỀN"
     ) == 4
 
+    assert extract_chapter_number(
+        "CHƯƠNG IV: CẠNH TRANH VÀ ĐỘC QUYỀN"
+    ) == 4
+
     print()
     print("=" * 72)
-    print("SSA-SBC-V1.1 SEMANTIC MAPPING TEST")
+    print("SSA-SBC V1.1 SEMANTIC MAPPING COMPATIBILITY TEST")
     print("=" * 72)
-    print("Version:", SSA_SBC_VERSION)
-    print("Preamble unassigned:", block_map[0] is None)
+    print("Runtime version:", SSA_SBC_VERSION)
+    print("Skip reasons:", reasons)
     print(
-        "TOC mapping:",
+        "First chapter mapping:",
         {
             key: block_map[key]
             for key in range(1, 6)
@@ -128,6 +147,7 @@ Kinh tế thị trường định hướng xã hội chủ nghĩa ở Việt Nam
             for key in range(6, 11)
         },
     )
+    print("Preamble excluded by V1.2+:", True)
     print("Chapter identity reuse:", True)
     print("Result: PASS")
     print("=" * 72)
