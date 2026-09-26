@@ -22,6 +22,7 @@ from app.schemas.quizzes import (
     QuizCreate,
     QuizGenerateRequest,
     QuizOut,
+    QuizV5GenerateRequest,
     QuizV5PreviewOut,
     QuizV5PreviewRequest,
 )
@@ -30,6 +31,9 @@ from app.services.quiz_v5.db_adapter import (
 )
 from app.services.quiz_v5.engine import (
     run_quiz_v5_engine,
+)
+from app.services.quiz_v5.persistence import (
+    persist_quiz_v5,
 )
 from app.services.source_access import (
     validate_owned_document_ids,
@@ -219,6 +223,92 @@ def generate_due(
         payload=payload,
     )
 
+
+
+
+# =========================================================
+# QUIZ V5 DETERMINISTIC PERSISTENCE
+# =========================================================
+#
+# Separate production route.
+# Existing /generate V4 remains untouched.
+# Persist only exact validated V5 results.
+# =========================================================
+
+
+@router.post(
+    "/generate-v5",
+    response_model=QuizOut,
+    status_code=201,
+)
+def generate_v5(
+    payload: QuizV5GenerateRequest,
+    db: DbSession,
+    user: CurrentUser,
+):
+    validate_owned_subject_id(
+        db,
+        user.id,
+        payload.subject_id,
+    )
+
+    document_ids = validate_owned_document_ids(
+        db,
+        user.id,
+        payload.document_ids,
+        subject_id=payload.subject_id,
+    )
+
+    try:
+        chunks = load_v5_document_chunks(
+            db,
+            document_ids=document_ids,
+            owner_id=user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    result = run_quiz_v5_engine(
+        chunks,
+        target=payload.question_count,
+        subject_family=payload.subject_family,
+        max_per_section=payload.max_per_section,
+    )
+
+    if not result.exact:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": (
+                    "QUIZ_V5_INSUFFICIENT_VALIDATED_QUESTIONS"
+                ),
+                "requested": result.requested,
+                "generated": len(
+                    result.questions
+                ),
+                "engine_version": result.version,
+                "rejected_blueprint_ids": list(
+                    result.diagnostics.rejected_blueprint_ids
+                ),
+            },
+        )
+
+    try:
+        return persist_quiz_v5(
+            db,
+            owner_id=user.id,
+            request=payload,
+            document_ids=document_ids,
+            result=result,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
 
 
 # =========================================================

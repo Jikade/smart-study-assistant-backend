@@ -56,6 +56,50 @@ class QuizGenerateRequest(BaseModel):
 
 
 
+
+class QuizV5GenerateRequest(BaseModel):
+    subject_id: int | None = None
+    document_ids: list[int] = Field(
+        default_factory=list,
+        min_length=1,
+        max_length=20,
+    )
+    title: str = Field(
+        min_length=1,
+        max_length=300,
+    )
+    description: str | None = None
+    question_count: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+    )
+    difficulty: str = Field(
+        default="MEDIUM",
+        pattern="^(EASY|MEDIUM|HARD)$",
+    )
+    duration_minutes: int | None = Field(
+        default=None,
+        gt=0,
+    )
+    visibility: str = Field(
+        default="PRIVATE",
+        pattern="^(PRIVATE|UNLISTED|PUBLIC)$",
+    )
+    subject_family: str = Field(
+        default="general",
+        pattern=(
+            "^(general|history|economics|biology|"
+            "physics|geography)$"
+        ),
+    )
+    max_per_section: int | None = Field(
+        default=2,
+        ge=1,
+        le=50,
+    )
+
+
 class QuizV5PreviewRequest(BaseModel):
     subject_id: int | None = None
     document_ids: list[int] = Field(
