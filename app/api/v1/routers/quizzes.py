@@ -22,6 +22,18 @@ from app.schemas.quizzes import (
     QuizCreate,
     QuizGenerateRequest,
     QuizOut,
+    QuizV5PreviewOut,
+    QuizV5PreviewRequest,
+)
+from app.services.quiz_v5.db_adapter import (
+    load_document_chunks as load_v5_document_chunks,
+)
+from app.services.quiz_v5.engine import (
+    run_quiz_v5_engine,
+)
+from app.services.source_access import (
+    validate_owned_document_ids,
+    validate_owned_subject_id,
 )
 from app.services.quiz_service import (
     create_quiz,
@@ -206,6 +218,133 @@ def generate_due(
         owner_id=user.id,
         payload=payload,
     )
+
+
+
+# =========================================================
+# QUIZ V5 READ-ONLY PREVIEW
+# =========================================================
+#
+# This route intentionally does NOT persist Quiz/Question rows.
+# It is a production-facing integration gate for the deterministic
+# V5 engine while the existing /generate V4 path remains untouched.
+# Keep this static route before /{quiz_id}.
+# =========================================================
+
+
+@router.post(
+    "/generate-v5-preview",
+    response_model=QuizV5PreviewOut,
+)
+def generate_v5_preview(
+    payload: QuizV5PreviewRequest,
+    db: DbSession,
+    user: CurrentUser,
+):
+    validate_owned_subject_id(
+        db,
+        user.id,
+        payload.subject_id,
+    )
+
+    document_ids = validate_owned_document_ids(
+        db,
+        user.id,
+        payload.document_ids,
+        subject_id=payload.subject_id,
+    )
+
+    try:
+        chunks = load_v5_document_chunks(
+            db,
+            document_ids=document_ids,
+            owner_id=user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    result = run_quiz_v5_engine(
+        chunks,
+        target=payload.question_count,
+        subject_family=payload.subject_family,
+        max_per_section=payload.max_per_section,
+    )
+
+    return {
+        "engine_version": result.version,
+        "subject_family": payload.subject_family,
+        "requested": result.requested,
+        "generated": len(result.questions),
+        "exact": result.exact,
+        "source_chars": result.source_chars,
+        "knowledge_count": len(result.knowledge),
+        "blueprint_count": len(result.blueprints),
+        "replacement_iterations": (
+            result.diagnostics.iterations
+        ),
+        "structured_fallback_count": (
+            result.diagnostics.structured_fallback_count
+        ),
+        "rejected_blueprint_ids": list(
+            result.diagnostics.rejected_blueprint_ids
+        ),
+        "questions": [
+            {
+                "order": order,
+                "blueprint_id": item.blueprint.id,
+                "blueprint_type": (
+                    item.blueprint.blueprint_type.value
+                ),
+                "knowledge_id": (
+                    item.blueprint.knowledge_id
+                ),
+                "stem": item.blueprint.stem,
+                "correct_answer": (
+                    item.blueprint.correct_answer
+                ),
+                "distractors": list(
+                    item.distractors
+                ),
+                "source_document_id": int(
+                    item.blueprint.evidence.document_id
+                ),
+                "source_chunk_id": int(
+                    item.blueprint.evidence.chunk_id
+                ),
+                "source_section_id": (
+                    int(
+                        item.blueprint.evidence.section_id
+                    )
+                    if item.blueprint.evidence.section_id
+                    is not None
+                    else None
+                ),
+                "evidence": (
+                    item.blueprint.evidence.text
+                ),
+                "quality_score": float(
+                    item.blueprint.quality_score
+                ),
+                "validation_score": float(
+                    item.validation_score
+                ),
+                "distractor_origins": list(
+                    item.metadata.get(
+                        "distractor_origins",
+                        (),
+                    )
+                    or ()
+                ),
+            }
+            for order, item in enumerate(
+                result.questions,
+                start=1,
+            )
+        ],
+    }
 
 
 # =========================================================

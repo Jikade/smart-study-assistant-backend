@@ -55,6 +55,65 @@ class QuizGenerateRequest(BaseModel):
     duration_minutes: int | None = Field(default=None, gt=0)
 
 
+
+class QuizV5PreviewRequest(BaseModel):
+    subject_id: int | None = None
+    document_ids: list[int] = Field(
+        default_factory=list,
+        min_length=1,
+        max_length=20,
+    )
+    question_count: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+    )
+    subject_family: str = Field(
+        default="general",
+        pattern=(
+            "^(general|history|economics|biology|"
+            "physics|geography)$"
+        ),
+    )
+    max_per_section: int | None = Field(
+        default=2,
+        ge=1,
+        le=50,
+    )
+
+
+class QuizV5PreviewQuestion(BaseModel):
+    order: int
+    blueprint_id: str
+    blueprint_type: str
+    knowledge_id: str
+    stem: str
+    correct_answer: str
+    distractors: list[str]
+    source_document_id: int
+    source_chunk_id: int
+    source_section_id: int | None = None
+    evidence: str
+    quality_score: float
+    validation_score: float
+    distractor_origins: list[str]
+
+
+class QuizV5PreviewOut(BaseModel):
+    engine_version: str
+    subject_family: str
+    requested: int
+    generated: int
+    exact: bool
+    source_chars: int
+    knowledge_count: int
+    blueprint_count: int
+    replacement_iterations: int
+    structured_fallback_count: int
+    rejected_blueprint_ids: list[str]
+    questions: list[QuizV5PreviewQuestion]
+
+
 class OptionOut(ORMModel):
     id: int
     question_id: int
